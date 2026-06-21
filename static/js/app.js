@@ -114,6 +114,7 @@ async function generate() {
   const fd = new FormData();
   fd.append("prompt", p);
   fd.append("preset", selectedPreset);
+  fd.append("model",  $("model-select").value);
   fd.append("seed",   seedInput.value);
   fd.append("width",  widthInput.value);
   fd.append("height", heightInput.value);
@@ -255,6 +256,8 @@ deleteBtn.addEventListener("click", async () => {
 });
 
 /* ── Gallery ── */
+const imageCache = {};
+
 async function loadGallery() {
   const params = new URLSearchParams();
   if (searchQ)      params.set("q",      searchQ);
@@ -269,9 +272,11 @@ async function loadGallery() {
     return;
   }
 
+  images.forEach(img => imageCache[img.id] = img);
+
   galleryGrid.innerHTML = images.map(img => `
     <div class="gallery-thumb ${activeImage?.id === img.id ? 'active' : ''}"
-         data-id="${img.id}" onclick="loadImage(${JSON.stringify(JSON.stringify(img))})">
+         data-id="${img.id}" onclick="loadImageById('${img.id}')">
       <img src="${img.thumb_url}" alt="" loading="lazy">
       <div class="thumb-prompt">${img.prompt || ''}</div>
     </div>
@@ -280,8 +285,9 @@ async function loadGallery() {
   await loadTagBar();
 }
 
-function loadImage(jsonStr) {
-  const img = JSON.parse(jsonStr);
+function loadImageById(id) {
+  const img = imageCache[id];
+  if (!img) return;
   showImage(img);
   setTokens(img.tokens_in || 0, img.tokens_out || 0);
   selectThumb(img.id);

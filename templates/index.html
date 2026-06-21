@@ -30,6 +30,15 @@
         </div>
 
         <div class="field">
+          <label>Model</label>
+          <select id="model-select">
+            <option value="claude-haiku-4-5">Haiku — fast &amp; cheap</option>
+            <option value="claude-sonnet-4-6" selected>Sonnet — default</option>
+            <option value="claude-opus-4-6">Opus — best</option>
+          </select>
+        </div>
+
+                <div class="field">
           <label>Preset palette</label>
           <div class="preset-grid">
             <button class="preset-btn active" data-preset="">None</button>
@@ -74,7 +83,10 @@
 
         <button class="generate-btn" id="generate-btn">
           <span id="btn-label">Generate</span>
-          <span class="spinner hidden" id="spinner">◌</span>
+          <svg class="spinner hidden" id="spinner" width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <polygon id="spin-hex" points="10,1 17,5 17,15 10,19 3,15 3,5" stroke="white" stroke-width="1.5" fill="none" stroke-linejoin="round"/>
+          <polygon id="spin-tri" points="10,4 15,13 5,13" stroke="white" stroke-width="1" fill="white" opacity="0.4"/>
+        </svg>
         </button>
 
         <div class="token-meter hidden" id="token-meter">
@@ -152,6 +164,13 @@
       </div>
     </aside>
 
+  </div>
+
+    <div class="lightbox-inner">
+      <button class="lightbox-close" id="lightbox-close">✕</button>
+      <img class="lightbox-img" id="lightbox-img" alt="">
+      <div class="lightbox-caption" id="lightbox-caption"></div>
+    </div>
   </div>
   <script src="/static/js/app.js"></script>
 </body>

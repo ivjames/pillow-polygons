@@ -103,6 +103,7 @@ Rules:
 - If ref is provided, use ref.getpixel((x,y)) to sample dominant colors
 
 Available presets inject palette dict with keys: bg, atmosphere, accent, grain
+Always use palette.get('bg', (20,20,30)) style access — palette may be empty if no preset selected.
 Available fonts (use try/except):
   /usr/share/fonts/truetype/google-fonts/Poppins-Light.ttf
   /usr/share/fonts/truetype/google-fonts/Poppins-Bold.ttf
@@ -114,7 +115,7 @@ def image_to_b64(path):
     with open(path, "rb") as f:
         return base64.standard_b64encode(f.read()).decode("utf-8")
 
-def call_claude(prompt, ref_path=None, preset=None, seed=42):
+def call_claude(prompt, ref_path=None, preset=None, seed=42, model='claude-sonnet-4-6'):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     user_content = []
@@ -141,7 +142,7 @@ def call_claude(prompt, ref_path=None, preset=None, seed=42):
     })
 
     response = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=model,
         max_tokens=4096,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_content}]
@@ -192,10 +193,32 @@ def generate():
         f.save(ref_path)
         ref_pil = PILImage.open(ref_path).convert("RGB")
 
+    model = request.form.get('model', 'claude-sonnet-4-6')
     try:
-        scene_code, tokens_in, tokens_out = call_claude(prompt, ref_path, preset, seed)
+        scene_code, tokens_in, tokens_out = call_claude(prompt, ref_path, preset, seed, model)
     except Exception as e:
         return jsonify({"error": f"Claude API error: {e}"}), 500
+
+    # syntax check — retry once if bad
+    def check_syntax(code):
+        try:
+            compile(code, "<scene>", "exec")
+            return None
+        except SyntaxError as e:
+            return str(e)
+
+    syntax_err = check_syntax(scene_code)
+    if syntax_err:
+        try:
+            fix_prompt = f"The following Python scene code has a syntax error: {syntax_err}\n\nFix it and return only the corrected code, no explanation:\n\n{scene_code}"
+            scene_code, tokens_in2, tokens_out2 = call_claude(fix_prompt, None, preset, seed, model)
+            tokens_in  += tokens_in2
+            tokens_out += tokens_out2
+        except Exception as e:
+            return jsonify({"error": f"Syntax error and fix failed: {syntax_err}"}), 500
+        syntax_err2 = check_syntax(scene_code)
+        if syntax_err2:
+            return jsonify({"error": f"Syntax error persisted after retry: {syntax_err2}", "scene_code": scene_code}), 500
 
     # render
     img_id   = uuid.uuid4().hex

@@ -140,7 +140,8 @@ def render(
     img, draw = _make_canvas(W, H, preset)
     svg_rec   = SVGRecorder(W, H)
     rng       = random.Random(seed)
-    palette   = PRESETS.get(preset, {}) if preset else {}
+    _base_palette = {"bg": (20,20,30), "atmosphere": (30,30,50,40), "accent": (200,200,255), "grain": 2000}
+    palette   = {**_base_palette, **(PRESETS.get(preset, {}) if preset else {})}
 
     ctx = {
         "img":       img,

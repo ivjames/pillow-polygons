@@ -1,0 +1,179 @@
+#!/bin/bash
+set -e
+BASE=/var/www/poly
+
+cat > $BASE/templates/index.html << 'EOF_HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pillow Polygons</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+  <div class="app">
+
+    <!-- ── BANNER ── -->
+    <header class="banner-header">
+      <img src="/static/banner.png" alt="Pillow Polygons">
+    </header>
+
+    <!-- ── LEFT SIDEBAR: Controls ── -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <span class="sidebar-logo">⬡ Controls</span>
+        <button class="icon-btn" id="toggle-sidebar" title="Collapse">‹</button>
+      </div>
+
+      <div class="sidebar-body">
+        <div class="field">
+          <label>Prompt</label>
+          <textarea id="prompt" rows="5" placeholder="Describe your scene… e.g. 'a lighthouse at night in swamp preset'"></textarea>
+        </div>
+
+        <div class="field">
+          <label>Model</label>
+          <select id="model-select">
+            <option value="claude-haiku-4-5">Haiku — fast &amp; cheap</option>
+            <option value="claude-sonnet-4-6" selected>Sonnet — default</option>
+            <option value="claude-opus-4-6">Opus — best</option>
+          </select>
+        </div>
+
+                <div class="field">
+          <label>Preset palette</label>
+          <div class="preset-grid">
+            <button class="preset-btn active" data-preset="">None</button>
+            <button class="preset-btn" data-preset="night">Night</button>
+            <button class="preset-btn" data-preset="golden">Golden</button>
+            <button class="preset-btn" data-preset="swamp">Swamp</button>
+            <button class="preset-btn" data-preset="bone">Bone</button>
+          </div>
+        </div>
+
+        <div class="field row">
+          <div class="half">
+            <label>Width px</label>
+            <input type="number" id="width" value="1024" min="256" max="2048" step="128">
+          </div>
+          <div class="half">
+            <label>Height px</label>
+            <input type="number" id="height" value="1024" min="256" max="2048" step="128">
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Seed</label>
+          <div class="seed-row">
+            <input type="number" id="seed" value="42" min="0" max="99999">
+            <button class="icon-btn dark" id="random-seed" title="Random seed">⟳</button>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Reference image <span class="muted">optional — sampled for color</span></label>
+          <div class="upload-zone" id="upload-zone">
+            <input type="file" id="ref-input" accept="image/*" hidden>
+            <div class="upload-inner" id="upload-inner">
+              <span class="upload-icon">⊕</span>
+              <span>Drop or click to upload</span>
+            </div>
+            <img id="ref-preview" class="ref-preview hidden" alt="Reference">
+            <button class="remove-ref hidden" id="remove-ref">✕</button>
+          </div>
+        </div>
+
+        <button class="generate-btn" id="generate-btn">
+          <span id="btn-label">Generate</span>
+          <svg class="spinner hidden" id="spinner" width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <polygon id="spin-hex" points="10,1 17,5 17,15 10,19 3,15 3,5" stroke="white" stroke-width="1.5" fill="none" stroke-linejoin="round"/>
+          <polygon id="spin-tri" points="10,4 15,13 5,13" stroke="white" stroke-width="1" fill="white" opacity="0.4"/>
+        </svg>
+        </button>
+
+        <div class="token-meter hidden" id="token-meter">
+          <div class="token-row">
+            <span class="token-label">IN</span>
+            <span class="token-val in-val" id="t-in">—</span>
+          </div>
+          <div class="token-row">
+            <span class="token-label">OUT</span>
+            <span class="token-val out-val" id="t-out">—</span>
+          </div>
+          <div class="token-row">
+            <span class="token-label">TOTAL</span>
+            <span class="token-val tot-val" id="t-total">—</span>
+          </div>
+        </div>
+
+        <div class="error-box hidden" id="error-box"></div>
+      </div>
+    </aside>
+
+    <!-- ── CENTER: Image display ── -->
+    <main class="canvas-area">
+      <div class="image-frame" id="image-frame">
+
+        <div class="empty-state" id="empty-state">
+          <div class="empty-diamonds">
+            <div class="empty-diamond" style="background:#ff3b7a"></div>
+            <div class="empty-diamond" style="background:#1a90ff"></div>
+            <div class="empty-diamond" style="background:#22dd88"></div>
+            <div class="empty-diamond" style="background:#ffe000"></div>
+          </div>
+          <p>Enter a prompt and hit Generate<br><span style="font-size:11px;opacity:0.6">⌘↵ to generate</span></p>
+        </div>
+
+        <img id="result-img" class="result-img hidden" alt="Generated">
+
+        <div class="img-meta hidden" id="img-meta">
+          <div class="meta-tags" id="meta-tags"></div>
+          <div class="meta-actions">
+            <input type="text" id="tag-input" placeholder="Add tag…" class="inline-input" style="width:110px">
+            <button class="small-btn" id="add-tag-btn">+ Tag</button>
+            <select id="folder-select" class="inline-input">
+              <option value="">Add to folder…</option>
+            </select>
+            <a id="download-btn" class="small-btn" download>↓ PNG</a>
+            <a id="svg-download-btn" class="small-btn hidden" download>↓ SVG</a>
+            <button class="small-btn danger" id="delete-btn">✕ Delete</button>
+          </div>
+        </div>
+
+      </div>
+    </main>
+
+    <!-- ── RIGHT PANEL: Gallery ── -->
+    <aside class="gallery-panel" id="gallery-panel">
+      <div class="gallery-header">
+        <input type="text" id="search-input" class="search-input" placeholder="Search prompts…">
+        <button class="icon-btn" id="toggle-gallery" title="Collapse">›</button>
+      </div>
+
+      <div class="folder-bar" id="folder-bar">
+        <button class="folder-chip active" data-folder="">All</button>
+      </div>
+
+      <div class="tag-bar" id="tag-bar"></div>
+
+      <div class="gallery-grid" id="gallery-grid">
+        <div class="gallery-empty">No images yet</div>
+      </div>
+
+      <div class="folder-controls">
+        <input type="text" id="new-folder-input" class="inline-input" placeholder="New folder…">
+        <button class="small-btn" id="create-folder-btn">+ Folder</button>
+      </div>
+    </aside>
+
+  </div>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
+EOF_HTML
+
+pm2 restart poly-app
+echo 'Done'
