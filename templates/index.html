@@ -7,6 +7,9 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/css/app.css">
+{% if captcha_sitekey %}
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+{% endif %}
 </head>
 <body>
   <div class="app">
@@ -79,6 +82,33 @@
             <img id="ref-preview" class="ref-preview hidden" alt="Reference">
             <button class="remove-ref hidden" id="remove-ref">✕</button>
           </div>
+        </div>
+
+        <!-- Honeypot: hidden from humans, bots tend to fill it. Do not remove. -->
+        <div class="hp-field" aria-hidden="true">
+          <label>Website</label>
+          <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
+        </div>
+
+        <!-- Signed, timestamped anti-bot form token issued at page load. -->
+        <input type="hidden" id="form-token" value="{{ form_token }}">
+
+        {% if captcha_sitekey %}
+        <!-- Turnstile widget (only when CAPTCHA_SITEKEY is configured). It injects
+             a hidden <input name="cf-turnstile-response"> the JS reads on submit. -->
+        <div class="field">
+          <div class="cf-turnstile" data-sitekey="{{ captcha_sitekey }}"></div>
+        </div>
+        {% endif %}
+
+        <!-- Content policy notice + required acknowledgement. -->
+        <div class="policy-notice">
+          <p>Don't upload or attempt to generate NSFW or illegal content.
+             Uploads and prompts may be screened.</p>
+          <label class="ack-row">
+            <input type="checkbox" id="ack-checkbox">
+            <span>I understand and accept the content policy.</span>
+          </label>
         </div>
 
         <button class="generate-btn" id="generate-btn">

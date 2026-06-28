@@ -1,8 +1,9 @@
 import os, json, sqlite3, uuid, base64, sys
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory, render_template, g
+from flask import Flask, request, jsonify, send_from_directory, render_template, g, after_this_request
 from PIL import Image as PILImage
 import anthropic
+import anti_abuse
 
 # ── paths ──────────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
@@ -16,10 +17,15 @@ os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 # inject renderer into path
 sys.path.insert(0, BASE_DIR)
-from renderer import render as poly_render
+from renderer import render as poly_render, validate_scene as renderer_validate, SceneValidationError
+import sandbox
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB upload limit
+
+# anti-abuse setup: pins PIL.MAX_IMAGE_PIXELS and syncs MAX_CONTENT_LENGTH to
+# MAX_UPLOAD_MB. This is the module's only side-effecting call.
+anti_abuse.init(app)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
@@ -115,16 +121,21 @@ def image_to_b64(path):
     with open(path, "rb") as f:
         return base64.standard_b64encode(f.read()).decode("utf-8")
 
-def call_claude(prompt, ref_path=None, preset=None, seed=42, model='claude-sonnet-4-6'):
+def call_claude(prompt, ref_path=None, preset=None, seed=42, model='claude-sonnet-4-6', ref_mime=None):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     user_content = []
 
     if ref_path and os.path.exists(ref_path):
-        ext = ref_path.rsplit(".", 1)[-1].lower()
-        mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                "png": "image/png", "gif": "image/gif",
-                "webp": "image/webp"}.get(ext, "image/jpeg")
+        # Use the MIME detected by validate_image_upload (the real content type),
+        # falling back to extension only if a caller didn't supply one.
+        if ref_mime:
+            mime = ref_mime
+        else:
+            ext = ref_path.rsplit(".", 1)[-1].lower()
+            mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "png": "image/png", "gif": "image/gif",
+                    "webp": "image/webp"}.get(ext, "image/jpeg")
         user_content.append({
             "type": "image",
             "source": {
@@ -169,33 +180,83 @@ def row_to_dict(row):
 # ── routes: pages ──────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    return render_template("index.html")
+    # Issue a signed, timestamped form token embedded in the page. The generate
+    # endpoint rejects submissions with a missing/forged/too-fast token.
+    # CAPTCHA_SITEKEY drives the client-side Turnstile widget; it must be set
+    # alongside CAPTCHA_SECRET (server) for CAPTCHA to work in a browser.
+    return render_template("index.html",
+                           form_token=anti_abuse.make_form_token(),
+                           captcha_sitekey=os.environ.get("CAPTCHA_SITEKEY", ""))
 
 # ── routes: generation ─────────────────────────────────────────────────────
 @app.route("/api/generate", methods=["POST"])
+@anti_abuse.generate_rate_limiters()   # strict per-min + per-day cap, applied first
 def generate():
     prompt  = request.form.get("prompt", "").strip()
     preset  = request.form.get("preset") or None
-    seed    = int(request.form.get("seed", 42))
-    width   = int(request.form.get("width", 1024))
-    height  = int(request.form.get("height", 1024))
+    # Untrusted numerics: parse + clamp so `seed=abc` no longer 500s and
+    # `width=999999` can't DoS the renderer.
+    seed    = anti_abuse.safe_int(request.form.get("seed", 42), 42,
+                                  anti_abuse.SEED_MIN, anti_abuse.SEED_MAX)
+    width   = anti_abuse.safe_int(request.form.get("width", 1024), 1024,
+                                  anti_abuse.DIM_MIN, anti_abuse.DIM_MAX)
+    height  = anti_abuse.safe_int(request.form.get("height", 1024), 1024,
+                                  anti_abuse.DIM_MIN, anti_abuse.DIM_MAX)
 
     if not prompt:
         return jsonify({"error": "Prompt required"}), 400
 
-    # handle optional ref image
+    # ── spam / bot gates: run BEFORE any Claude spend (fail fast) ──
+    if anti_abuse.check_honeypot(request.form):
+        # Bot filled the hidden field. Reject quietly.
+        return jsonify({"error": "Submission rejected."}), 400
+    if not (request.form.get("ack") or "").strip():
+        return jsonify({"error": "You must accept the content policy to generate."}), 400
+    ok, why = anti_abuse.verify_form_token(request.form.get("form_token", ""))
+    if not ok:
+        return jsonify({"error": f"Submission rejected ({why})."}), 400
+    if not anti_abuse.verify_captcha(request.form.get("captcha_token", "")):
+        return jsonify({"error": "CAPTCHA verification failed."}), 400
+
+    # ── prompt moderation (keyword always; model pass if MODERATION_ENABLED) ──
+    # The content policy prohibits NSFW *and* illegal content, so any non-"allow"
+    # verdict (both "block" and the softer "flag"=NSFW) is rejected.
+    mod_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+    verdict = anti_abuse.moderate_prompt(prompt, mod_client)
+    if verdict["action"] != "allow":
+        return jsonify({"error": f"Prompt rejected: {verdict['reason']}"}), 400
+
+    # ── handle optional ref image: validate + sanitize, never trust the bytes ──
     ref_path = None
     ref_pil  = None
+    ref_mime = None
     if "ref" in request.files and request.files["ref"].filename:
-        f        = request.files["ref"]
-        ref_name = f"{uuid.uuid4().hex}.jpg"
+        try:
+            clean = anti_abuse.validate_image_upload(request.files["ref"])
+        except anti_abuse.UploadRejected as e:
+            return jsonify({"error": e.message}), e.status
+        img_verdict = anti_abuse.moderate_image(clean.image, mod_client)
+        if img_verdict["action"] != "allow":
+            return jsonify({"error": f"Reference image rejected: {img_verdict['reason']}"}), 400
+        ref_name = f"{uuid.uuid4().hex}.{clean.ext}"
         ref_path = os.path.join(UPLOADS_DIR, ref_name)
-        f.save(ref_path)
-        ref_pil = PILImage.open(ref_path).convert("RGB")
+        clean.save(ref_path)          # re-encoded, EXIF/polyglot stripped
+        ref_pil  = clean.image
+        ref_mime = clean.mime
+        # Delete the ref after the request finishes (no TTL sweep needed):
+        # uploads/ is otherwise write-only and never pruned.
+        @after_this_request
+        def _drop_ref(response, _p=ref_path):
+            try:
+                if os.path.exists(_p):
+                    os.remove(_p)
+            except OSError:
+                pass
+            return response
 
     model = request.form.get('model', 'claude-sonnet-4-6')
     try:
-        scene_code, tokens_in, tokens_out = call_claude(prompt, ref_path, preset, seed, model)
+        scene_code, tokens_in, tokens_out = call_claude(prompt, ref_path, preset, seed, model, ref_mime)
     except Exception as e:
         return jsonify({"error": f"Claude API error: {e}"}), 500
 
@@ -220,17 +281,43 @@ def generate():
         if syntax_err2:
             return jsonify({"error": f"Syntax error persisted after retry: {syntax_err2}", "scene_code": scene_code}), 500
 
-    # render
+    # sandbox safety check — reject scene code that uses forbidden constructs
+    # (imports, dunder access, os/eval/exec, etc.). Retry once asking Claude to
+    # remove them, since an occasional model slip shouldn't fail a legit prompt.
+    safety_err = renderer_validate(scene_code)
+    if safety_err:
+        try:
+            fix_prompt = (f"The following Python scene code was rejected by a security sandbox "
+                          f"because: {safety_err}. Rewrite it to draw the same scene using ONLY "
+                          f"the pre-injected names (img, draw, W, H, rng, ref, palette, Image, "
+                          f"ImageDraw, ImageFont, math, random) with no imports, no dunder "
+                          f"attributes, and no eval/exec/open. Return only the corrected code:\n\n{scene_code}")
+            scene_code, tokens_in3, tokens_out3 = call_claude(fix_prompt, None, preset, seed, model)
+            tokens_in  += tokens_in3
+            tokens_out += tokens_out3
+        except Exception:
+            return jsonify({"error": f"Scene rejected by sandbox: {safety_err}"}), 400
+        safety_err2 = renderer_validate(scene_code)
+        if safety_err2:
+            return jsonify({"error": f"Scene rejected by sandbox: {safety_err2}", "scene_code": scene_code}), 400
+
+    # render — executed in a resource-limited subprocess sandbox (sandbox.py)
     img_id   = uuid.uuid4().hex
     filename = f"{img_id}.png"
 
     try:
-        result = poly_render(
+        result = sandbox.run_scene(
             scene_code, filename=filename,
             width=width, height=height, seed=seed,
             ref=ref_pil, preset=preset, thumbnail=True,
             _output_dir=RENDERS_DIR
         )
+    except SceneValidationError as e:
+        return jsonify({"error": f"Scene rejected by sandbox: {e}", "scene_code": scene_code}), 400
+    except sandbox.RenderTimeout as e:
+        return jsonify({"error": f"Render timed out: {e}"}), 400
+    except sandbox.RenderError as e:
+        return jsonify({"error": f"Render error: {e}", "scene_code": scene_code}), 500
     except Exception as e:
         return jsonify({"error": f"Render error: {e}", "scene_code": scene_code}), 500
 
@@ -285,6 +372,7 @@ def list_images():
                      "thumb_url": f"/static/renders/{r['thumb']}"} for r in rows])
 
 @app.route("/api/images/<img_id>", methods=["DELETE"])
+@anti_abuse.mutate_rate_limit
 def delete_image(img_id):
     db  = get_db()
     row = db.execute("SELECT * FROM images WHERE id=?", (img_id,)).fetchone()
@@ -299,8 +387,9 @@ def delete_image(img_id):
     return jsonify({"ok": True})
 
 @app.route("/api/images/<img_id>/tags", methods=["POST"])
+@anti_abuse.mutate_rate_limit
 def add_tag(img_id):
-    name = request.json.get("name", "").strip().lower()
+    name = (request.get_json(silent=True) or {}).get("name", "").strip().lower()
     if not name: return jsonify({"error": "Name required"}), 400
     db = get_db()
     existing = db.execute("SELECT id FROM tags WHERE name=?", (name,)).fetchone()
@@ -314,6 +403,7 @@ def add_tag(img_id):
     return jsonify({"ok": True, "tag": name})
 
 @app.route("/api/images/<img_id>/tags/<tag_name>", methods=["DELETE"])
+@anti_abuse.mutate_rate_limit
 def remove_tag(img_id, tag_name):
     db     = get_db()
     tag    = db.execute("SELECT id FROM tags WHERE name=?", (tag_name,)).fetchone()
@@ -323,8 +413,9 @@ def remove_tag(img_id, tag_name):
     return jsonify({"ok": True})
 
 @app.route("/api/images/<img_id>/folders", methods=["POST"])
+@anti_abuse.mutate_rate_limit
 def add_to_folder(img_id):
-    name = request.json.get("name", "").strip()
+    name = (request.get_json(silent=True) or {}).get("name", "").strip()
     if not name: return jsonify({"error": "Name required"}), 400
     db = get_db()
     existing  = db.execute("SELECT id FROM folders WHERE name=?", (name,)).fetchone()
@@ -338,6 +429,7 @@ def add_to_folder(img_id):
     return jsonify({"ok": True, "folder": name})
 
 @app.route("/api/images/<img_id>/folders/<folder_name>", methods=["DELETE"])
+@anti_abuse.mutate_rate_limit
 def remove_from_folder(img_id, folder_name):
     db = get_db()
     f  = db.execute("SELECT id FROM folders WHERE name=?", (folder_name,)).fetchone()
@@ -358,8 +450,9 @@ def list_folders():
     return jsonify([dict(r) for r in rows])
 
 @app.route("/api/folders", methods=["POST"])
+@anti_abuse.mutate_rate_limit
 def create_folder():
-    name = request.json.get("name", "").strip()
+    name = (request.get_json(silent=True) or {}).get("name", "").strip()
     if not name: return jsonify({"error": "Name required"}), 400
     db = get_db()
     existing = db.execute("SELECT id FROM folders WHERE name=?", (name,)).fetchone()
@@ -370,6 +463,7 @@ def create_folder():
     return jsonify({"ok": True, "id": fid, "name": name})
 
 @app.route("/api/folders/<name>", methods=["DELETE"])
+@anti_abuse.mutate_rate_limit
 def delete_folder(name):
     db = get_db()
     f  = db.execute("SELECT id FROM folders WHERE name=?", (name,)).fetchone()
