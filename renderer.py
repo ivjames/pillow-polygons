@@ -272,9 +272,58 @@ def render(
         ctx["img"]  = img
         ctx["draw"] = ImageDraw.Draw(img)
 
-    out_dir = _output_dir or OUTPUT_DIR
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, filename)
+    meta = {
+        "filename":    filename,
+        "width":       W,
+        "height":      H,
+        "seed":        seed,
+        "preset":      preset,
+        "format":      "python",
+        "layers":      len(codes),
+        "rendered_at": datetime.utcnow().isoformat() + "Z",
+        "scene_code":  codes,
+    }
+    return _write_outputs(img, svg_rec, filename=filename, out_dir=_output_dir,
+                          meta=meta, preset=preset, thumbnail=thumbnail)
+
+
+def render_json(
+    scene,
+    filename:    str   = "output.png",
+    width:       int   = 1024,
+    height:      int   = 1024,
+    seed:        int   = 42,
+    preset:      str   = None,
+    thumbnail:   bool  = True,
+    _output_dir: str   = None,
+) -> dict:
+    """Render a *declarative JSON* scene — the safe-by-construction alternative to
+    render(): the scene is data, interpreted by scene_json.paint() with a fixed
+    set of Pillow primitives. No exec, so no RCE surface. Same return shape as
+    render(). `scene` is a dict or a JSON string.
+
+    Schema invalid -> SceneValidationError (the same type render() raises for a
+    rejected scene, so the sandbox/app error paths treat both identically)."""
+    import scene_json
+
+    if isinstance(scene, str):
+        try:
+            scene = json.loads(scene)
+        except (ValueError, TypeError) as e:
+            raise SceneValidationError(f"scene is not valid JSON: {e}")
+    err = scene_json.validate_scene_json(scene)
+    if err:
+        raise SceneValidationError(err)
+
+    W, H = width, height
+    img, _ = _make_canvas(W, H, preset)
+    svg_rec = SVGRecorder(W, H)
+    rng     = random.Random(seed)
+    _base_palette = {"bg": (20,20,30), "atmosphere": (30,30,50,40), "accent": (200,200,255), "grain": 2000}
+    palette = {**_base_palette, **(PRESETS.get(preset, {}) if preset else {})}
+
+    img = scene_json.paint(scene, img=img, draw=ImageDraw.Draw(img), svg=svg_rec,
+                           W=W, H=H, rng=rng, palette=palette)
 
     meta = {
         "filename":    filename,
@@ -282,13 +331,24 @@ def render(
         "height":      H,
         "seed":        seed,
         "preset":      preset,
-        "layers":      len(codes),
+        "format":      "json",
+        "layers":      len(scene.get("layers", [])),
         "rendered_at": datetime.utcnow().isoformat() + "Z",
-        "scene_code":  codes,
+        "scene":       scene,
     }
+    return _write_outputs(img, svg_rec, filename=filename, out_dir=_output_dir,
+                          meta=meta, preset=preset, thumbnail=thumbnail)
+
+
+def _write_outputs(img, svg_rec, *, filename, out_dir, meta, preset, thumbnail):
+    """Shared output stage for both render paths: PNG + JSON sidecar, an optional
+    SVG twin (when the scene emitted vector primitives), and a thumbnail."""
+    out_dir  = out_dir or OUTPUT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, filename)
+
     _save_with_sidecar(img, out_path, meta)
 
-    # SVG output
     svg_path = None
     if svg_rec._elems:
         bg = PRESETS[preset]["bg"] if preset and preset in PRESETS else (255,255,255)
@@ -298,7 +358,6 @@ def render(
         with open(svg_path, "w") as f:
             f.write(svg_str)
 
-    # Thumbnail
     thumb_path = None
     if thumbnail:
         thumb = img.copy()

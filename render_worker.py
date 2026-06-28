@@ -44,12 +44,13 @@ def _load_ref(ref_name):
 def _result_for(spec):
     """Render one job spec; return a JSON-serializable result envelope."""
     try:
-        ref = _load_ref(spec.get("ref"))
+        scene_format = spec.get("scene_format", "python")
+        ref = _load_ref(spec.get("ref")) if scene_format != "json" else None
         result = sandbox.run_scene(
             spec["scene_code"],
             filename=spec["filename"],
             width=spec["width"], height=spec["height"], seed=spec["seed"],
-            ref=ref, preset=spec.get("preset"),
+            ref=ref, preset=spec.get("preset"), scene_format=scene_format,
             thumbnail=spec.get("thumbnail", True),
             _output_dir=spec.get("output_dir") or RENDERS_DIR,
         )

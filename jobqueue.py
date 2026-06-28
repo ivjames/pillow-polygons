@@ -89,7 +89,8 @@ def _quiet_remove(path):
 
 
 def submit_and_wait(scene_code, *, filename, width, height, seed,
-                    ref=None, preset=None, thumbnail=True, output_dir=None):
+                    ref=None, preset=None, thumbnail=True, output_dir=None,
+                    scene_format="python"):
     """Hand a render job to the worker and block for its result.
 
     Returns the same dict renderer.render() produces. Raises the same exceptions
@@ -110,6 +111,7 @@ def submit_and_wait(scene_code, *, filename, width, height, seed,
         "id": job_id, "scene_code": scene_code, "filename": filename,
         "width": width, "height": height, "seed": seed, "preset": preset,
         "thumbnail": thumbnail, "ref": ref_name, "output_dir": output_dir,
+        "scene_format": scene_format,
     }
     spec_path = os.path.join(incoming(), f"{job_id}.json")
     _atomic_write(spec_path, json.dumps(spec))

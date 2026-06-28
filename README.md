@@ -57,6 +57,7 @@ All optional — defaults preserve current behavior for a single user.
 | `RENDER_CONCURRENCY` | `1` | Max simultaneous render subprocesses. Keeps worst-case render memory at one `RENDER_MEM_MB` (vs. `threads × RENDER_MEM_MB`); size the container memory accordingly. |
 | `RENDER_MODE` | `local` | `worker` routes scene execution to the network-less render worker (see `DEPLOY.md`); `local` runs the in-process subprocess sandbox. |
 | `JOBS_DIR` | `/jobs` | Shared job-queue directory used when `RENDER_MODE=worker`. |
+| `SCENE_FORMAT` | `python` | `python` asks the model for Pillow scene **code** (expressive, exec'd, sandboxed). `json` asks for a declarative JSON **scene** drawn by a fixed interpreter — no code execution at all. See "Scene format" below. |
 
 ### Optional upgrades (not hard-required)
 
@@ -117,6 +118,40 @@ See `DEPLOY.md`.
 > hard and to fail a slipped model output fast; the controls that actually
 > *hold* a determined attacker are Layer B (resource limits) and Layer C (no
 > network + seccomp + read-only rootfs). Treat A as defense-in-depth, not the wall.
+
+### Scene format: code vs. data (`SCENE_FORMAT`)
+
+Everything above (layers A–C) exists to *contain* the fact that the default path
+**executes model-generated Python**. `SCENE_FORMAT=json` sidesteps the problem
+instead of containing it: the model returns a declarative JSON scene, and
+`scene_json.py` draws it with a fixed set of primitives (`polygon`, `ellipse`,
+`rectangle`, `line`, `arc`, `point`, `text`, plus `gradient`/`grain`/`vignette`).
+There is no `exec`, no `eval`, and no attribute access — so the prompt-injection
+→ RCE class **does not exist** on this path. The threat model shrinks to *data*
+validation: caps on layer/op/point counts and grain size (enforced in
+`validate_scene_json`), with the subprocess resource limits kept as
+defense-in-depth around Pillow itself.
+
+The trade-off is expressiveness. Python scene code is Turing-complete — the look
+comes partly from *computation* (procedural placement, arithmetic gradients,
+`rng`-driven variation). JSON can only use the primitives the renderer
+implements, so output trends toward "what the vocabulary allows." Both paths are
+wired through the same sandbox, worker queue, cost accounting, and SVG twin, so
+you can run them side by side (`SCENE_FORMAT=json python app.py`) and compare.
+
+| | `python` (default) | `json` |
+|---|---|---|
+| Model emits | Pillow scene **code** | declarative **JSON** scene |
+| Executed by | `exec()` in `renderer.render()` | interpreted by `scene_json.paint()` |
+| RCE surface | yes — needs the full sandbox stack | **none** (no code runs) |
+| Threat model | contain arbitrary code | validate data (size caps) |
+| Expressiveness | Turing-complete | fixed primitive set |
+| Retries | syntax check + AST sandbox | JSON parse + schema check |
+
+**Recommendation:** `json` is the more durable boundary for untrusted/public use
+(safe by construction); keep `python` when you want maximum procedural richness
+on trusted input. This is a prototype of the data-not-code approach — the
+primitive set is intentionally small and can grow.
 
 ### Stronger isolation if this takes real public traffic
 

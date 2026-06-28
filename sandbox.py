@@ -82,16 +82,20 @@ def _apply_rlimits():
             pass
 
 
-def _child(q, scene_code, kwargs, ref_png):
+def _child(q, scene_code, kwargs, ref_png, scene_format):
     # Import inside the child so rlimits are applied before heavy work.
-    from renderer import render as _render, SceneValidationError
+    from renderer import render as _render, render_json as _render_json, SceneValidationError
     try:
         _apply_rlimits()
-        ref = None
-        if ref_png:
-            from PIL import Image
-            ref = Image.open(io.BytesIO(ref_png)).convert("RGB")
-        result = _render(scene_code, ref=ref, **kwargs)
+        if scene_format == "json":
+            # Declarative path: data, not code — no ref image is involved.
+            result = _render_json(scene_code, **kwargs)
+        else:
+            ref = None
+            if ref_png:
+                from PIL import Image
+                ref = Image.open(io.BytesIO(ref_png)).convert("RGB")
+            result = _render(scene_code, ref=ref, **kwargs)
         q.put(("ok", result))
     except SceneValidationError as e:
         q.put(("blocked", str(e)))
@@ -101,18 +105,20 @@ def _child(q, scene_code, kwargs, ref_png):
         q.put(("err", f"{type(e).__name__}: {e}"))
 
 
-def run_scene(scene_code, ref=None, **kwargs):
-    """Run renderer.render(scene_code, ref=ref, **kwargs) in a sandboxed child.
+def run_scene(scene_code, ref=None, scene_format="python", **kwargs):
+    """Run a render in a sandboxed child. `scene_format` selects the path:
+    "python" -> renderer.render() (exec'd scene code, ref honored), "json" ->
+    renderer.render_json() (declarative data, no exec, ref ignored).
 
     Returns the render result dict. Raises:
-      - renderer.SceneValidationError  if the scene used a forbidden construct,
+      - renderer.SceneValidationError  if the scene was rejected (bad code / bad JSON),
       - RenderTimeout                  if it blew the wall-clock budget,
       - RenderError                    on crash/OOM/scene exception.
     """
     from renderer import SceneValidationError
 
     ref_png = None
-    if ref is not None:
+    if ref is not None and scene_format != "json":
         buf = io.BytesIO()
         ref.convert("RGB").save(buf, format="PNG")
         ref_png = buf.getvalue()
@@ -123,7 +129,7 @@ def run_scene(scene_code, ref=None, **kwargs):
         # fork keeps startup cheap and inherits the already-imported PIL/renderer.
         ctx = mp.get_context("fork")
         q = ctx.Queue()
-        proc = ctx.Process(target=_child, args=(q, scene_code, kwargs, ref_png), daemon=True)
+        proc = ctx.Process(target=_child, args=(q, scene_code, kwargs, ref_png, scene_format), daemon=True)
         proc.start()
         proc.join(_wall_seconds())
 

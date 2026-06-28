@@ -21,6 +21,7 @@ sys.path.insert(0, BASE_DIR)
 from renderer import render as poly_render, validate_scene as renderer_validate, SceneValidationError
 import sandbox
 import jobqueue
+import scene_json
 
 app = Flask(__name__)
 # Text-only API (no uploads): cap request bodies at 1MB — generate only carries a
@@ -64,17 +65,27 @@ def compute_cost(model, tokens_in, tokens_out):
 #              so this web tier never exec()s scene code (issue #2). See render_worker.py.
 RENDER_MODE = os.environ.get("RENDER_MODE", "local").strip().lower()
 
+# What the model is asked to produce, and which renderer path runs it:
+#   "python" — raw Pillow scene code, exec'd by renderer.render(). Expressive
+#              (Turing-complete) but a prompt-injection -> RCE surface, contained
+#              by the sandbox stack (AST allowlist + subprocess + network-less worker).
+#   "json"   — a declarative JSON scene drawn by renderer.render_json() over a
+#              fixed primitive set. No exec, so there is no RCE surface at all —
+#              the threat model shrinks to data validation. See scene_json.py.
+SCENE_FORMAT = os.environ.get("SCENE_FORMAT", "python").strip().lower()
 
-def _render_scene(scene_code, *, filename, width, height, seed, ref, preset):
+
+def _render_scene(scene_payload, *, filename, width, height, seed, preset):
     """Dispatch a render to the worker queue or the in-process sandbox. Both
-    return renderer.render()'s dict and raise the same exceptions."""
+    return the renderer's dict and raise the same exceptions. The scene format
+    (python/json) is taken from SCENE_FORMAT and selects the renderer path."""
     if RENDER_MODE == "worker":
         return jobqueue.submit_and_wait(
-            scene_code, filename=filename, width=width, height=height, seed=seed,
-            ref=ref, preset=preset, thumbnail=True, output_dir=RENDERS_DIR)
+            scene_payload, filename=filename, width=width, height=height, seed=seed,
+            preset=preset, thumbnail=True, output_dir=RENDERS_DIR, scene_format=SCENE_FORMAT)
     return sandbox.run_scene(
-        scene_code, filename=filename, width=width, height=height, seed=seed,
-        ref=ref, preset=preset, thumbnail=True, _output_dir=RENDERS_DIR)
+        scene_payload, filename=filename, width=width, height=height, seed=seed,
+        preset=preset, thumbnail=True, _output_dir=RENDERS_DIR, scene_format=SCENE_FORMAT)
 
 # ── DB ─────────────────────────────────────────────────────────────────────
 def get_db():
@@ -176,6 +187,48 @@ Available fonts (use try/except):
 
 Remember the output format: raw Python only, no markdown fences, no prose. Nothing else."""
 
+
+SYSTEM_PROMPT_JSON = """You are the Pillow Polygons scene generator.
+
+Output a single JSON object that DESCRIBES the scene to draw — and NOTHING else.
+No markdown fences, no prose, no explanation. The response must be valid JSON,
+its first character '{' and its last character '}'.
+
+The canvas is W×H pixels, origin at the top-left, coordinates in pixels.
+
+Schema:
+{
+  "background": {"type": "gradient", "from": [r,g,b], "to": [r,g,b], "direction": "vertical"|"horizontal"},
+                 // OR {"type": "solid", "color": [r,g,b]} — omit to keep the preset background
+  "layers": [
+    {"alpha": 0-255,            // optional overall layer opacity, for soft glows/atmosphere
+     "ops": [ <op>, ... ]}
+  ]
+}
+
+Each <op> is exactly one of:
+  {"op":"polygon","points":[[x,y],...],"fill":<color>,"outline":<color>,"width":n}
+  {"op":"ellipse","bbox":[x0,y0,x1,y1],"fill":<color>,"outline":<color>,"width":n}
+  {"op":"rectangle","bbox":[x0,y0,x1,y1],"fill":<color>,"outline":<color>,"width":n}
+  {"op":"line","points":[[x,y],...],"fill":<color>,"width":n}
+  {"op":"arc","bbox":[x0,y0,x1,y1],"start":deg,"end":deg,"fill":<color>,"width":n}
+  {"op":"point","points":[[x,y],...],"fill":<color>}
+  {"op":"text","xy":[x,y],"text":"...","fill":<color>,"size":n}
+  {"op":"grain","count":n,"fill":<color>,"alpha":a}   // n random 1px speckles for texture
+  {"op":"vignette","strength":0-255}                  // dark edge falloff; end scenes with this
+
+<color> is [r,g,b] or [r,g,b,a] (0-255), or one of the palette key strings
+"bg", "atmosphere", or "accent".
+
+Composition guidance (match the house style):
+- Use a gradient background, then build subjects from layered polygons + ellipses
+  with separate shadow / base / highlight layers.
+- Eyes: socket → iris → pupil → gleam.
+- Use a low-alpha layer of "grain" for texture, and finish with a "vignette" op.
+
+Hard limits: ≤ 64 layers, ≤ 5000 ops total, ≤ 2000 points per shape, grain count
+≤ 20000. Output raw JSON only — nothing before '{' or after '}'."""
+
 def _strip_code_fences(text):
     """Enforce the 'raw Python only' output contract on the model's behalf.
 
@@ -196,7 +249,7 @@ def _strip_code_fences(text):
     return "\n".join(lines).strip()
 
 
-def call_claude(prompt, preset=None, seed=42, model='claude-sonnet-4-6'):
+def call_claude(prompt, preset=None, seed=42, model='claude-sonnet-4-6', system=None):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     preset_note = f"\nActive preset: {preset}" if preset else ""
@@ -209,7 +262,7 @@ def call_claude(prompt, preset=None, seed=42, model='claude-sonnet-4-6'):
     response = client.messages.create(
         model=model,
         max_tokens=4096,
-        system=SYSTEM_PROMPT,
+        system=system or SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_content}]
     )
 
@@ -220,6 +273,114 @@ def call_claude(prompt, preset=None, seed=42, model='claude-sonnet-4-6'):
     tokens_out   = response.usage.output_tokens
 
     return scene_code, tokens_in, tokens_out
+
+
+class SceneGenError(Exception):
+    """A scene the model couldn't produce acceptably. Carries the HTTP status and
+    (optionally) the offending scene text to echo back to the client."""
+    def __init__(self, message, status=400, scene=None):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.scene = scene
+
+
+def _check_syntax(code):
+    try:
+        compile(code, "<scene>", "exec")
+        return None
+    except SyntaxError as e:
+        return str(e)
+
+
+def _generate_python_scene(prompt, preset, seed, model):
+    """Python path: generate scene code, then gate it on a syntax check and the
+    AST sandbox, each with one Claude retry (a model slip shouldn't fail a legit
+    prompt). Returns (code, tokens_in, tokens_out) or raises SceneGenError."""
+    try:
+        code, tin, tout = call_claude(prompt, preset, seed, model)
+    except Exception as e:
+        raise SceneGenError(f"Claude API error: {e}", 500)
+
+    err = _check_syntax(code)
+    if err:
+        try:
+            code, ti, to = call_claude(
+                f"The following Python scene code has a syntax error: {err}\n\nFix it and "
+                f"return ONLY the corrected raw Python code — no markdown fences, no "
+                f"explanation, no prose:\n\n{code}", preset, seed, model)
+            tin += ti; tout += to
+        except Exception:
+            raise SceneGenError(f"Syntax error and fix failed: {err}", 500)
+        err2 = _check_syntax(code)
+        if err2:
+            raise SceneGenError(f"Syntax error persisted after retry: {err2}", 500, scene=code)
+
+    serr = renderer_validate(code)
+    if serr:
+        try:
+            code, ti, to = call_claude(
+                f"The following Python scene code was rejected by a security sandbox because: "
+                f"{serr}. Rewrite it to draw the same scene using ONLY the pre-injected names "
+                f"(img, draw, W, H, rng, palette, Image, ImageDraw, ImageFont, math, random) "
+                f"with no imports, no dunder attributes, and no eval/exec/open. Return ONLY the "
+                f"corrected raw Python code — no markdown fences, no explanation:\n\n{code}",
+                preset, seed, model)
+            tin += ti; tout += to
+        except Exception:
+            raise SceneGenError(f"Scene rejected by sandbox: {serr}", 400)
+        serr2 = renderer_validate(code)
+        if serr2:
+            raise SceneGenError(f"Scene rejected by sandbox: {serr2}", 400, scene=code)
+
+    return code, tin, tout
+
+
+def _parse_scene_json(raw):
+    """Return (scene_dict, None) or (None, error_str). Fences are tolerated."""
+    try:
+        scene = json.loads(_strip_code_fences(raw))
+    except (ValueError, TypeError) as e:
+        return None, f"not valid JSON ({e})"
+    err = scene_json.validate_scene_json(scene)
+    if err:
+        return None, err
+    return scene, None
+
+
+def _generate_json_scene(prompt, preset, seed, model):
+    """JSON path: generate a declarative scene, validate it against the schema,
+    one retry on a parse/schema miss. There is no code to sandbox here — a valid
+    scene is just data. Returns (scene_dict, tokens_in, tokens_out)."""
+    try:
+        raw, tin, tout = call_claude(prompt, preset, seed, model, system=SYSTEM_PROMPT_JSON)
+    except Exception as e:
+        raise SceneGenError(f"Claude API error: {e}", 500)
+
+    scene, err = _parse_scene_json(raw)
+    if err:
+        try:
+            raw, ti, to = call_claude(
+                f"Your previous response was rejected: {err}. Return ONLY a single valid JSON "
+                f"object matching the scene schema — no markdown fences, no prose:\n\n{raw}",
+                preset, seed, model, system=SYSTEM_PROMPT_JSON)
+            tin += ti; tout += to
+        except Exception:
+            raise SceneGenError(f"Scene rejected: {err}", 400)
+        scene, err2 = _parse_scene_json(raw)
+        if err2:
+            raise SceneGenError(f"Scene rejected after retry: {err2}", 400, scene=raw)
+
+    return scene, tin, tout
+
+
+def _scene_text(payload):
+    """Serialize a scene payload for storage / error echoes: code is already a
+    string; a JSON scene dict is dumped compactly."""
+    if isinstance(payload, str):
+        return payload
+    return json.dumps(payload)
+
 
 def row_to_dict(row):
     d = dict(row)
@@ -287,70 +448,34 @@ def generate():
 
     model = request.form.get('model', 'claude-sonnet-4-6')
     try:
-        scene_code, tokens_in, tokens_out = call_claude(prompt, preset, seed, model)
-    except Exception as e:
-        return jsonify({"error": f"Claude API error: {e}"}), 500
-
-    # syntax check — retry once if bad
-    def check_syntax(code):
-        try:
-            compile(code, "<scene>", "exec")
-            return None
-        except SyntaxError as e:
-            return str(e)
-
-    syntax_err = check_syntax(scene_code)
-    if syntax_err:
-        try:
-            fix_prompt = f"The following Python scene code has a syntax error: {syntax_err}\n\nFix it and return ONLY the corrected raw Python code — no markdown fences, no explanation, no prose:\n\n{scene_code}"
-            scene_code, tokens_in2, tokens_out2 = call_claude(fix_prompt, preset, seed, model)
-            tokens_in  += tokens_in2
-            tokens_out += tokens_out2
-        except Exception as e:
-            return jsonify({"error": f"Syntax error and fix failed: {syntax_err}"}), 500
-        syntax_err2 = check_syntax(scene_code)
-        if syntax_err2:
-            return jsonify({"error": f"Syntax error persisted after retry: {syntax_err2}", "scene_code": scene_code}), 500
-
-    # sandbox safety check — reject scene code that uses forbidden constructs
-    # (imports, dunder access, os/eval/exec, etc.). Retry once asking Claude to
-    # remove them, since an occasional model slip shouldn't fail a legit prompt.
-    safety_err = renderer_validate(scene_code)
-    if safety_err:
-        try:
-            fix_prompt = (f"The following Python scene code was rejected by a security sandbox "
-                          f"because: {safety_err}. Rewrite it to draw the same scene using ONLY "
-                          f"the pre-injected names (img, draw, W, H, rng, palette, Image, "
-                          f"ImageDraw, ImageFont, math, random) with no imports, no dunder "
-                          f"attributes, and no eval/exec/open. Return ONLY the corrected raw "
-                          f"Python code — no markdown fences, no explanation:\n\n{scene_code}")
-            scene_code, tokens_in3, tokens_out3 = call_claude(fix_prompt, preset, seed, model)
-            tokens_in  += tokens_in3
-            tokens_out += tokens_out3
-        except Exception:
-            return jsonify({"error": f"Scene rejected by sandbox: {safety_err}"}), 400
-        safety_err2 = renderer_validate(scene_code)
-        if safety_err2:
-            return jsonify({"error": f"Scene rejected by sandbox: {safety_err2}", "scene_code": scene_code}), 400
+        if SCENE_FORMAT == "json":
+            scene_payload, tokens_in, tokens_out = _generate_json_scene(prompt, preset, seed, model)
+        else:
+            scene_payload, tokens_in, tokens_out = _generate_python_scene(prompt, preset, seed, model)
+    except SceneGenError as e:
+        body = {"error": e.message}
+        if e.scene is not None:
+            body["scene_code"] = e.scene
+        return jsonify(body), e.status
 
     # render — in-process sandbox (local) or the network-less worker (worker mode)
     img_id   = uuid.uuid4().hex
     filename = f"{img_id}.png"
 
+    scene_text = _scene_text(scene_payload)
     try:
         result = _render_scene(
-            scene_code, filename=filename,
-            width=width, height=height, seed=seed,
-            ref=ref_pil, preset=preset
+            scene_payload, filename=filename,
+            width=width, height=height, seed=seed, preset=preset
         )
     except SceneValidationError as e:
-        return jsonify({"error": f"Scene rejected by sandbox: {e}", "scene_code": scene_code}), 400
+        return jsonify({"error": f"Scene rejected by sandbox: {e}", "scene_code": scene_text}), 400
     except sandbox.RenderTimeout as e:
         return jsonify({"error": f"Render timed out: {e}"}), 400
     except sandbox.RenderError as e:
-        return jsonify({"error": f"Render error: {e}", "scene_code": scene_code}), 500
+        return jsonify({"error": f"Render error: {e}", "scene_code": scene_text}), 500
     except Exception as e:
-        return jsonify({"error": f"Render error: {e}", "scene_code": scene_code}), 500
+        return jsonify({"error": f"Render error: {e}", "scene_code": scene_text}), 500
 
     thumb_name = os.path.basename(result["thumb"]) if result.get("thumb") else None
     svg_name   = os.path.basename(result["svg"])   if result.get("svg")   else None
@@ -362,7 +487,7 @@ def generate():
                             tokens_in, tokens_out, model, scene_code, created_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (img_id, filename, thumb_name, prompt, preset, seed, width, height,
-          tokens_in, tokens_out, model, scene_code, created_at))
+          tokens_in, tokens_out, model, scene_text, created_at))
     db.commit()
 
     row = db.execute("SELECT * FROM images WHERE id=?", (img_id,)).fetchone()
