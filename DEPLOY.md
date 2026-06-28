@@ -61,6 +61,17 @@ are documented in the README; the deployment-relevant additions are:
 |-----|---------|---------|
 | `POLY_DB_PATH` | `<app>/poly.db` | SQLite location — pointed at the `/data` volume so the rootfs can stay read-only. |
 | `RENDER_CPU_SECONDS` / `RENDER_MEM_MB` / `RENDER_WALL_SECONDS` / `RENDER_FSIZE_MB` | `10` / `1024` / `20` / `64` | Per-render subprocess limits. |
+| `RENDER_CONCURRENCY` | `1` | Max simultaneous render subprocesses (see memory budget below). |
+
+> **Memory budget — keep these consistent.** gunicorn runs `--threads 4`, so up
+> to 4 requests can render at once. Renders are serialized by `RENDER_CONCURRENCY`
+> (default 1), so the worst-case render footprint is a single `RENDER_MEM_MB`.
+> Size the container so `mem_limit ≥ RENDER_MEM_MB × RENDER_CONCURRENCY + ~512 MiB`
+> headroom (web process + in-flight refs). With the defaults that's
+> `1024 × 1 + 512 → 1536m`. This guarantees the per-render `RLIMIT_AS` returns a
+> controlled "exceeded memory limit" error *before* the container OOM-killer
+> restarts the web process. If you raise `RENDER_CONCURRENCY` or `RENDER_MEM_MB`,
+> raise `mem_limit` to match.
 
 > **Scaling note:** the image runs **one** gunicorn worker (with threads) on
 > purpose — the rate-limit and form-token state is in-process. Running multiple

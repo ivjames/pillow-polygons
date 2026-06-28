@@ -31,6 +31,11 @@ services:
       RENDER_MEM_MB: "1024"
       RENDER_WALL_SECONDS: "20"
       RENDER_FSIZE_MB: "64"
+      # Serialize renders so worst-case render memory is a single RENDER_MEM_MB,
+      # not (threads x RENDER_MEM_MB). Keep mem_limit >= RENDER_MEM_MB *
+      # RENDER_CONCURRENCY + ~512MiB headroom so the per-render rlimit returns a
+      # controlled error before the container OOM-kills the web process.
+      RENDER_CONCURRENCY: "1"
 
     ports:
       - "127.0.0.1:8040:8040"
@@ -46,7 +51,7 @@ services:
       # dangerous syscalls. A stricter, network-less allowlist for a dedicated
       # render worker lives in seccomp/render-worker.json (roadmap — see issue #2).
     pids_limit: 256
-    mem_limit: 1536m
+    mem_limit: 1536m                  # >= RENDER_MEM_MB(1024) * RENDER_CONCURRENCY(1) + headroom
     cpus: "2.0"
 
     # ── writable surfaces (everything else is read-only) ─────────────────
