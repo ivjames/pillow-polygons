@@ -124,20 +124,35 @@ See `DEPLOY.md`.
 Everything above (layers A–C) exists to *contain* the fact that the default path
 **executes model-generated Python**. `SCENE_FORMAT=json` sidesteps the problem
 instead of containing it: the model returns a declarative JSON scene, and
-`scene_json.py` draws it with a fixed set of primitives (`polygon`, `ellipse`,
-`rectangle`, `line`, `arc`, `point`, `text`, plus `gradient`/`grain`/`vignette`).
-There is no `exec`, no `eval`, and no attribute access — so the prompt-injection
-→ RCE class **does not exist** on this path. The threat model shrinks to *data*
+`scene_json.py` draws it with a fixed set of primitives — shapes (`polygon`,
+`ellipse`, `rectangle`, `line`, `arc`, `bezier`, `point`, `text`), backgrounds
+(`gradient`, `radial`, `solid`), effects (`grain`, `vignette`), and the
+expanding ops `scatter`/`repeat`. Every primitive has a vector SVG
+representation, so the SVG twin stays faithful. There is no `exec`, no `eval`,
+and no attribute access — so the prompt-injection → RCE class **does not exist**
+on this path. The threat model shrinks to *data*
 validation: caps on layer/op/point counts and grain size (enforced in
 `validate_scene_json`), with the subprocess resource limits kept as
 defense-in-depth around Pillow itself.
 
 The trade-off is expressiveness. Python scene code is Turing-complete — the look
 comes partly from *computation* (procedural placement, arithmetic gradients,
-`rng`-driven variation). JSON can only use the primitives the renderer
-implements, so output trends toward "what the vocabulary allows." Both paths are
-wired through the same sandbox, worker queue, cost accounting, and SVG twin, so
-you can run them side by side (`SCENE_FORMAT=json python app.py`) and compare.
+`rng`-driven variation). The JSON path closes much of that gap with **expanding
+ops**: `scatter` (N random copies of a shape), `repeat` (a grid of copies), and
+`bezier`/gradient/`radial` — one compact op becomes many vector elements, so the
+renderer does the looping instead of the model. Both paths are wired through the
+same sandbox, worker queue, cost accounting, and SVG twin, so you can run them
+side by side (`SCENE_FORMAT=json python app.py`) and compare.
+
+**Token cost.** Output tokens dominate API cost, so the expanding ops matter:
+for a gradient sky + 200 stars + moon + vignette, the JSON (using `scatter`) is
+~90 output tokens vs. ~160 for the equivalent Python — *cheaper*, because the
+model writes one `scatter` op instead of a 200-iteration loop's worth of detail.
+The expensive failure mode is a model that **enumerates** every shape by hand
+(~3,700 tokens for the same scene); the JSON system prompt explicitly steers away
+from that, and `MAX_OPS` (op-entry count) and `MAX_DRAWS` (expanded-primitive
+count) cap it. The input side is a wash — the slightly longer JSON system prompt
+is static and benefits from prompt caching.
 
 | | `python` (default) | `json` |
 |---|---|---|

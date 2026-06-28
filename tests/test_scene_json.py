@@ -45,6 +45,15 @@ REJECTED = {
     "too_many_ops":    {"layers": [{"ops": [{"op": "point", "points": [[0, 0]]}] * (scene_json.MAX_OPS + 1)}]},
     "too_many_points": {"layers": [{"ops": [{"op": "polygon", "points": [[0, 0]] * (scene_json.MAX_POINTS + 1)}]}]},
     "bad_text_type":   {"layers": [{"ops": [{"op": "text", "xy": [0, 0], "text": 123}]}]},
+    "bad_bezier_ctrl": {"layers": [{"ops": [{"op": "bezier", "points": [[0, 0], [1, 1]]}]}]},
+    # scatter/repeat templates must be leaf primitives (no recursion bombs)
+    "nested_scatter":  {"layers": [{"ops": [{"op": "scatter", "count": 2,
+                        "shape": {"op": "scatter", "count": 2, "shape": {"op": "point"}}}]}]},
+    "scatter_no_shape": {"layers": [{"ops": [{"op": "scatter", "count": 5}]}]},
+    # summed expanded draw count over budget (5 × 5000 > MAX_DRAWS)
+    "over_draw_budget": {"layers": [{"ops": [
+        {"op": "scatter", "count": scene_json.MAX_SCATTER,
+         "shape": {"op": "point", "points": [[0, 0]]}} for _ in range(5)]}]},
 }
 
 
@@ -88,6 +97,46 @@ def test_grain_count_is_clamped_not_unbounded():
     assert scene_json.validate_scene_json(scene) is None
     with tempfile.TemporaryDirectory() as d:
         res = renderer.render_json(scene, filename="g.png", width=64, height=64, _output_dir=d)
+        assert os.path.exists(res["png"])
+
+
+VECTOR = {
+    "background": {"type": "radial", "inner": [60, 60, 110], "outer": [5, 5, 15],
+                   "cx": 128, "cy": 100, "r": 160},
+    "layers": [
+        {"ops": [
+            {"op": "bezier", "points": [[20, 200], [90, 120], [160, 210], [236, 130]],
+             "stroke": [240, 220, 120], "width": 3},
+            {"op": "bezier", "points": [[50, 50], [128, 20], [200, 60]],
+             "stroke": [255, 255, 255], "fill": [80, 80, 160], "closed": True},
+            {"op": "scatter", "count": 120, "area": [0, 0, 256, 90],
+             "shape": {"op": "ellipse", "bbox": [-1, -1, 1, 1], "fill": [255, 255, 255]}},
+            {"op": "repeat", "nx": 6, "ny": 2, "dx": 40, "dy": 30, "x0": 20, "y0": 200,
+             "shape": {"op": "polygon", "points": [[0, 0], [16, 0], [8, 14]], "fill": "accent"}},
+        ]},
+    ],
+}
+
+
+def test_vector_primitives_render_with_vector_svg():
+    assert scene_json.validate_scene_json(VECTOR) is None
+    with tempfile.TemporaryDirectory() as d:
+        res = renderer.render_json(VECTOR, filename="vec.png", width=256, height=256, _output_dir=d)
+        assert os.path.exists(res["png"])
+        svg = open(res["svg"]).read()
+        assert "<defs>" in svg and "radialGradient" in svg, "radial bg should be a vector def"
+        assert " C " in svg, "cubic bezier should emit an SVG path"
+        assert svg.count("<ellipse") >= 120, "scatter should expand to vector ellipses"
+        assert svg.count("<polygon") >= 12, "repeat should expand to a 6×2 vector grid"
+
+
+def test_scatter_count_is_bounded_per_op():
+    # A single huge scatter clamps to MAX_SCATTER draws — bounded render time.
+    scene = {"layers": [{"ops": [{"op": "scatter", "count": 10 ** 7,
+             "shape": {"op": "point", "points": [[0, 0]]}}]}]}
+    assert scene_json.validate_scene_json(scene) is None
+    with tempfile.TemporaryDirectory() as d:
+        res = renderer.render_json(scene, filename="s.png", width=64, height=64, _output_dir=d)
         assert os.path.exists(res["png"])
 
 

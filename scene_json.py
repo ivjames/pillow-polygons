@@ -17,8 +17,9 @@ memory/wall-clock limits as defense-in-depth around Pillow itself).
 Schema (see SYSTEM_PROMPT_JSON in app.py for the model-facing description):
 
     {
-      "background": {"type": "gradient", "from": [r,g,b], "to": [r,g,b],
-                     "direction": "vertical"},        # or {"type":"solid","color":[r,g,b]}
+      "background": {"type": "gradient", "from": [r,g,b], "to": [r,g,b], "direction": "vertical"},
+                     # or {"type":"radial","inner":[r,g,b],"outer":[r,g,b],"cx":x,"cy":y,"r":n}
+                     # or {"type":"solid","color":[r,g,b]}
       "layers": [
         {"alpha": 255, "ops": [
             {"op": "polygon",   "points": [[x,y],...], "fill": <color>, "outline": <color>, "width": 1},
@@ -26,32 +27,46 @@ Schema (see SYSTEM_PROMPT_JSON in app.py for the model-facing description):
             {"op": "rectangle", "bbox": [x0,y0,x1,y1], "fill": <color>},
             {"op": "line",      "points": [[x,y],...], "fill": <color>, "width": 2},
             {"op": "arc",       "bbox": [...], "start": 0, "end": 180, "fill": <color>, "width": 2},
+            {"op": "bezier",    "points": [[x,y]x3or4], "stroke": <color>, "fill": <color>, "width": 2, "closed": false},
             {"op": "point",     "points": [[x,y],...], "fill": <color>},
             {"op": "text",      "xy": [x,y], "text": "hi", "fill": <color>, "size": 14},
             {"op": "grain",     "count": 2000, "fill": <color>, "alpha": 40},
-            {"op": "vignette",  "strength": 85}
+            {"op": "vignette",  "strength": 85},
+            # expanding ops — one compact op stamps out many vector shapes (token-cheap):
+            {"op": "scatter",   "count": 200, "area": [x0,y0,x1,y1], "shape": <leaf op>},
+            {"op": "repeat",    "nx": 8, "ny": 6, "dx": 60, "dy": 60, "x0": 0, "y0": 0, "shape": <leaf op>}
         ]}
       ]
     }
 
 <color> is [r,g,b] or [r,g,b,a] (0-255) or one of the palette keys
-"bg"/"atmosphere"/"accent".
+"bg"/"atmosphere"/"accent". All primitives have a vector SVG representation, so
+the SVG twin stays faithful.
 """
 
 from PIL import Image, ImageDraw, ImageFont
 
 # ── DoS caps (the JSON carries no code, so these *are* the threat model) ──────
+# Two independent budgets: MAX_OPS bounds the number of op *entries* in the JSON
+# (i.e. how much the model has to write — token cost); MAX_DRAWS bounds the
+# *expanded* primitive count actually rendered, so a compact op like scatter/
+# repeat/grain stays token-cheap yet can't turn into millions of draws.
 MAX_LAYERS  = 64
 MAX_OPS     = 5000
+MAX_DRAWS   = 20000
 MAX_POINTS  = 2000
 MAX_GRAIN   = 20000
+MAX_SCATTER = 5000
 MAX_TEXT    = 500
+MAX_BEZIER_SAMPLES = 64
 _COORD_CLAMP = 100_000
 
-ALLOWED_OPS = frozenset({
-    "polygon", "ellipse", "rectangle", "line", "arc", "point", "text",
-    "grain", "vignette",
+# Leaf primitives: things scatter/repeat may stamp out copies of.
+LEAF_OPS = frozenset({
+    "polygon", "ellipse", "rectangle", "line", "arc", "point", "text", "bezier",
 })
+# Everything the schema accepts (leaf primitives + the expanding/effect ops).
+ALLOWED_OPS = LEAF_OPS | frozenset({"grain", "vignette", "scatter", "repeat"})
 
 # Palette keys whose values are colors (palette["grain"] is a count, not a color).
 _PALETTE_COLOR_KEYS = ("bg", "atmosphere", "accent")
@@ -75,7 +90,7 @@ def validate_scene_json(scene):
     if bg is not None:
         if not isinstance(bg, dict):
             return "'background' must be an object"
-        if bg.get("type") not in (None, "solid", "gradient"):
+        if bg.get("type") not in (None, "solid", "gradient", "radial"):
             return f"unknown background type {bg.get('type')!r}"
 
     layers = scene.get("layers")
@@ -87,6 +102,7 @@ def validate_scene_json(scene):
         return f"too many layers ({len(layers)} > {MAX_LAYERS})"
 
     total_ops = 0
+    total_draws = 0
     for li, layer in enumerate(layers):
         if not isinstance(layer, dict):
             return f"layer {li} must be an object"
@@ -97,24 +113,65 @@ def validate_scene_json(scene):
         if total_ops > MAX_OPS:
             return f"too many ops total (> {MAX_OPS})"
         for oi, op in enumerate(ops):
-            if not isinstance(op, dict):
-                return f"op {li}.{oi} must be an object"
-            name = op.get("op")
-            if name not in ALLOWED_OPS:
-                return f"unknown op {name!r} (allowed: {', '.join(sorted(ALLOWED_OPS))})"
-            pts = op.get("points")
-            if pts is not None:
-                if not isinstance(pts, list):
-                    return f"op {li}.{oi} 'points' must be a list"
-                if len(pts) > MAX_POINTS:
-                    return f"op {li}.{oi} has too many points ({len(pts)} > {MAX_POINTS})"
-            if name == "text":
-                t = op.get("text", "")
-                if not isinstance(t, str):
-                    return f"op {li}.{oi} 'text' must be a string"
-                if len(t) > MAX_TEXT:
-                    return f"op {li}.{oi} text too long (> {MAX_TEXT})"
+            err = _validate_op(op, f"{li}.{oi}", nested=False)
+            if err:
+                return err
+            total_draws += _op_draw_cost(op)
+            if total_draws > MAX_DRAWS:
+                return f"scene draws too many primitives (> {MAX_DRAWS}); use fewer/smaller scatter/grain/repeat"
     return None
+
+
+def _validate_op(op, where, nested):
+    """Validate one op. `nested` ops (a scatter/repeat template) must be leaves."""
+    if not isinstance(op, dict):
+        return f"op {where} must be an object"
+    name = op.get("op")
+    allowed = LEAF_OPS if nested else ALLOWED_OPS
+    if name not in allowed:
+        kind = "template op" if nested else "op"
+        return f"unknown {kind} {name!r} (allowed: {', '.join(sorted(allowed))})"
+
+    pts = op.get("points")
+    if pts is not None:
+        if not isinstance(pts, list):
+            return f"op {where} 'points' must be a list"
+        if len(pts) > MAX_POINTS:
+            return f"op {where} has too many points ({len(pts)} > {MAX_POINTS})"
+
+    if name == "bezier":
+        if not isinstance(pts, list) or len(pts) not in (3, 4):
+            return f"op {where} 'bezier' needs 3 (quadratic) or 4 (cubic) control points"
+
+    if name == "text":
+        t = op.get("text", "")
+        if not isinstance(t, str):
+            return f"op {where} 'text' must be a string"
+        if len(t) > MAX_TEXT:
+            return f"op {where} text too long (> {MAX_TEXT})"
+
+    if name in ("scatter", "repeat"):
+        shape = op.get("shape")
+        if not isinstance(shape, dict):
+            return f"op {where} '{name}' needs a 'shape' template object"
+        serr = _validate_op(shape, f"{where}.shape", nested=True)
+        if serr:
+            return serr
+    return None
+
+
+def _op_draw_cost(op):
+    """Expanded primitive count an op contributes to the MAX_DRAWS budget."""
+    name = op.get("op")
+    if name == "grain":
+        return min(MAX_GRAIN, max(0, int(_num(op.get("count", 0)))))
+    if name == "scatter":
+        return min(MAX_SCATTER, max(0, int(_num(op.get("count", 0)))))
+    if name == "repeat":
+        nx = max(0, int(_num(op.get("nx", 0))))
+        ny = max(0, int(_num(op.get("ny", 0))))
+        return min(MAX_SCATTER, nx * ny)
+    return 1
 
 
 # ── coercion helpers (defensive: even post-validation, never trust the numbers) ─
@@ -256,11 +313,119 @@ def _draw_op(op, draw, svg, palette, W, H, rng):
         if svg is not None:
             svg.text(xy, text, fill=fill, font=font)
 
+    elif name == "bezier":
+        _bezier(op, draw, svg, palette)
+
     elif name == "grain":
         _grain(op, draw, palette, W, H, rng)
 
     elif name == "vignette":
         _vignette(draw, W, H, op.get("strength", 85))
+
+    elif name == "scatter":
+        _scatter(op, draw, svg, palette, W, H, rng)
+
+    elif name == "repeat":
+        _repeat(op, draw, svg, palette, W, H, rng)
+
+
+def _bezier(op, draw, svg, palette):
+    """A quadratic (3 control points) or cubic (4) bezier. Sampled to a polyline
+    for the PNG; emitted as a true vector <path> in the SVG twin. Token-cheap —
+    a smooth curve from 3-4 points instead of an enumerated polyline."""
+    ctrl = _points(op)
+    if len(ctrl) not in (3, 4):
+        return
+    stroke = _color(op.get("stroke"), palette, default=(255, 255, 255))
+    fill = _color(op.get("fill"), palette)
+    w = _width(op)
+    closed = bool(op.get("closed"))
+
+    n = MAX_BEZIER_SAMPLES
+    pts = []
+    for i in range(n + 1):
+        t = i / n
+        if len(ctrl) == 4:
+            (x0, y0), (x1, y1), (x2, y2), (x3, y3) = ctrl
+            mt = 1 - t
+            x = mt**3 * x0 + 3 * mt**2 * t * x1 + 3 * mt * t**2 * x2 + t**3 * x3
+            y = mt**3 * y0 + 3 * mt**2 * t * y1 + 3 * mt * t**2 * y2 + t**3 * y3
+        else:
+            (x0, y0), (x1, y1), (x2, y2) = ctrl
+            mt = 1 - t
+            x = mt**2 * x0 + 2 * mt * t * x1 + t**2 * x2
+            y = mt**2 * y0 + 2 * mt * t * y1 + t**2 * y2
+        pts.append((int(x), int(y)))
+
+    if closed and fill:
+        draw.polygon(pts, fill=fill)
+    draw.line(pts + ([pts[0]] if closed else []), fill=stroke, width=w)
+
+    if svg is not None:
+        if len(ctrl) == 4:
+            d = (f"M {ctrl[0][0]} {ctrl[0][1]} C {ctrl[1][0]} {ctrl[1][1]} "
+                 f"{ctrl[2][0]} {ctrl[2][1]} {ctrl[3][0]} {ctrl[3][1]}")
+        else:
+            d = (f"M {ctrl[0][0]} {ctrl[0][1]} Q {ctrl[1][0]} {ctrl[1][1]} "
+                 f"{ctrl[2][0]} {ctrl[2][1]}")
+        if closed:
+            d += " Z"
+        svg.path(d, fill=fill if closed else None, stroke=stroke, width=w)
+
+
+def _translate_op(op, dx, dy):
+    """Return a copy of a leaf op with all its coordinates shifted by (dx, dy).
+    Used to stamp scatter/repeat copies of a template shape."""
+    out = dict(op)
+    if "points" in op and isinstance(op["points"], list):
+        out["points"] = [[_num(p[0]) + dx, _num(p[1]) + dy]
+                         for p in op["points"] if isinstance(p, (list, tuple)) and len(p) >= 2]
+    if "bbox" in op and isinstance(op["bbox"], (list, tuple)) and len(op["bbox"]) >= 4:
+        b = op["bbox"]
+        out["bbox"] = [_num(b[0]) + dx, _num(b[1]) + dy, _num(b[2]) + dx, _num(b[3]) + dy]
+    if "xy" in op and isinstance(op["xy"], (list, tuple)) and len(op["xy"]) >= 2:
+        out["xy"] = [_num(op["xy"][0]) + dx, _num(op["xy"][1]) + dy]
+    return out
+
+
+def _scatter(op, draw, svg, palette, W, H, rng):
+    """Stamp `count` copies of a template `shape` at random offsets within `area`
+    (default: the whole canvas). One compact op -> many vector shapes."""
+    shape = op.get("shape")
+    if not isinstance(shape, dict):
+        return
+    count = max(0, min(MAX_SCATTER, int(_num(op.get("count", 0)))))
+    area = op.get("area")
+    if isinstance(area, (list, tuple)) and len(area) >= 4:
+        x0, y0, x1, y1 = (_num(area[0]), _num(area[1]), _num(area[2]), _num(area[3]))
+    else:
+        x0, y0, x1, y1 = 0, 0, W, H
+    lo_x, hi_x = int(min(x0, x1)), int(max(x0, x1))
+    lo_y, hi_y = int(min(y0, y1)), int(max(y0, y1))
+    for _ in range(count):
+        dx = rng.randint(lo_x, hi_x) if hi_x > lo_x else lo_x
+        dy = rng.randint(lo_y, hi_y) if hi_y > lo_y else lo_y
+        _draw_op(_translate_op(shape, dx, dy), draw, svg, palette, W, H, rng)
+
+
+def _repeat(op, draw, svg, palette, W, H, rng):
+    """Stamp a template `shape` across an nx×ny grid stepping by (dx, dy) from
+    (x0, y0). One compact op -> a tiled field of vector shapes."""
+    shape = op.get("shape")
+    if not isinstance(shape, dict):
+        return
+    nx = max(0, int(_num(op.get("nx", 1))))
+    ny = max(0, int(_num(op.get("ny", 1))))
+    if nx * ny > MAX_SCATTER:
+        return
+    dx = _num(op.get("dx", 0))
+    dy = _num(op.get("dy", 0))
+    x0 = _num(op.get("x0", 0))
+    y0 = _num(op.get("y0", 0))
+    for j in range(ny):
+        for i in range(nx):
+            _draw_op(_translate_op(shape, x0 + i * dx, y0 + j * dy),
+                     draw, svg, palette, W, H, rng)
 
 
 def _grain(op, draw, palette, W, H, rng):
@@ -283,7 +448,7 @@ def _vignette(draw, W, H, strength):
         draw.rectangle([r, r, W - r, H - r], outline=(0, 0, 0, a), width=10)
 
 
-def _paint_background(bg, img, palette, W, H):
+def _paint_background(bg, img, svg, palette, W, H):
     t = bg.get("type")
     if t == "gradient":
         c0 = _color(bg.get("from"), palette, default=(10, 10, 20))
@@ -300,9 +465,31 @@ def _paint_background(bg, img, palette, W, H):
                 d.line([(i, 0), (i, H)], fill=col)
             else:
                 d.line([(0, i), (W, i)], fill=col)
+        if svg is not None:
+            svg.linear_gradient_bg(c0, c1, horizontal)
+    elif t == "radial":
+        inner = _color(bg.get("inner"), palette, default=(60, 60, 90))
+        outer = _color(bg.get("outer"), palette, default=(8, 8, 16))
+        cx = int(_num(bg.get("cx", W / 2)))
+        cy = int(_num(bg.get("cy", H / 2)))
+        r = int(_num(bg.get("r", max(W, H) / 2))) or 1
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, W, H], fill=outer[:3])
+        steps = max(1, r // 2)
+        for s in range(steps, 0, -1):
+            f = s / steps                       # 1 at the edge (outer), ->0 at center (inner)
+            col = (int(outer[0] + (inner[0] - outer[0]) * (1 - f)),
+                   int(outer[1] + (inner[1] - outer[1]) * (1 - f)),
+                   int(outer[2] + (inner[2] - outer[2]) * (1 - f)))
+            rr = int(r * f)
+            d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill=col)
+        if svg is not None:
+            svg.radial_gradient_bg(inner, outer, cx, cy, r)
     elif t == "solid":
         c = _color(bg.get("color"), palette, default=(0, 0, 0))
         ImageDraw.Draw(img).rectangle([0, 0, W, H], fill=c[:3])
+        if svg is not None:
+            svg.rectangle([0, 0, W, H], fill=c[:3])
     # else: leave the canvas as created (e.g. the preset background color)
 
 
@@ -311,7 +498,7 @@ def paint(scene, *, img, draw, svg, W, H, rng, palette):
     """Draw a validated JSON scene onto `img`. Returns the final image (layer
     compositing replaces it). A single malformed op is skipped, not fatal —
     mirroring the way one bad draw call wouldn't abort the Python path."""
-    _paint_background(scene.get("background") or {}, img, palette, W, H)
+    _paint_background(scene.get("background") or {}, img, svg, palette, W, H)
 
     for layer in scene.get("layers", []):
         ops = layer.get("ops", []) or []

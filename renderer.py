@@ -185,12 +185,38 @@ class SVGRecorder:
             f'font-family="sans-serif">{text}</text>'
         )
 
+    def path(self, d, fill=None, stroke=None, width=1):
+        """A raw SVG path (used for bezier curves). `d` is a pre-built path string."""
+        s = f'stroke="{self._col(stroke)}" stroke-width="{width}"' if stroke else 'stroke="none"'
+        self._elems.append(f'<path d="{d}" fill="{self._col(fill)}" {s}/>')
+
+    def linear_gradient_bg(self, c0, c1, horizontal=False):
+        """Register a linear-gradient def and fill the whole canvas with it — one
+        vector element regardless of canvas size (resolution-independent, ~0 cost)."""
+        gid = f"g{len(self._defs)}"
+        x2, y2 = (1, 0) if horizontal else (0, 1)
+        self._defs.append(
+            f'<linearGradient id="{gid}" x1="0" y1="0" x2="{x2}" y2="{y2}">'
+            f'<stop offset="0" stop-color="{self._col(c0)}"/>'
+            f'<stop offset="1" stop-color="{self._col(c1)}"/></linearGradient>')
+        self._elems.append(f'<rect width="{self.W}" height="{self.H}" fill="url(#{gid})"/>')
+
+    def radial_gradient_bg(self, inner, outer, cx, cy, r):
+        gid = f"g{len(self._defs)}"
+        self._defs.append(
+            f'<radialGradient id="{gid}" cx="{cx/self.W:.3f}" cy="{cy/self.H:.3f}" '
+            f'r="{r/max(self.W,self.H):.3f}">'
+            f'<stop offset="0" stop-color="{self._col(inner)}"/>'
+            f'<stop offset="1" stop-color="{self._col(outer)}"/></radialGradient>')
+        self._elems.append(f'<rect width="{self.W}" height="{self.H}" fill="url(#{gid})"/>')
+
     def to_svg(self, bg_color=(255,255,255)):
         bg = self._col(bg_color)
         body = "\n  ".join(self._elems)
+        defs = ("\n  <defs>" + "".join(self._defs) + "</defs>") if self._defs else ""
         return (f'<?xml version="1.0" encoding="UTF-8"?>\n'
                 f'<svg xmlns="http://www.w3.org/2000/svg" '
-                f'width="{self.W}" height="{self.H}" viewBox="0 0 {self.W} {self.H}">\n'
+                f'width="{self.W}" height="{self.H}" viewBox="0 0 {self.W} {self.H}">{defs}\n'
                 f'  <rect width="{self.W}" height="{self.H}" fill="{bg}"/>\n'
                 f'  {body}\n</svg>')
 

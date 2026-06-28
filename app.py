@@ -199,7 +199,8 @@ The canvas is W×H pixels, origin at the top-left, coordinates in pixels.
 Schema:
 {
   "background": {"type": "gradient", "from": [r,g,b], "to": [r,g,b], "direction": "vertical"|"horizontal"},
-                 // OR {"type": "solid", "color": [r,g,b]} — omit to keep the preset background
+                 // OR {"type":"radial","inner":[r,g,b],"outer":[r,g,b],"cx":x,"cy":y,"r":n}
+                 // OR {"type":"solid","color":[r,g,b]} — omit to keep the preset background
   "layers": [
     {"alpha": 0-255,            // optional overall layer opacity, for soft glows/atmosphere
      "ops": [ <op>, ... ]}
@@ -212,22 +213,38 @@ Each <op> is exactly one of:
   {"op":"rectangle","bbox":[x0,y0,x1,y1],"fill":<color>,"outline":<color>,"width":n}
   {"op":"line","points":[[x,y],...],"fill":<color>,"width":n}
   {"op":"arc","bbox":[x0,y0,x1,y1],"start":deg,"end":deg,"fill":<color>,"width":n}
+  {"op":"bezier","points":[[x,y]×3or4],"stroke":<color>,"fill":<color>,"width":n,"closed":false}
+                 // 3 points = quadratic, 4 = cubic; smooth curve. "fill" only if closed.
   {"op":"point","points":[[x,y],...],"fill":<color>}
   {"op":"text","xy":[x,y],"text":"...","fill":<color>,"size":n}
   {"op":"grain","count":n,"fill":<color>,"alpha":a}   // n random 1px speckles for texture
   {"op":"vignette","strength":0-255}                  // dark edge falloff; end scenes with this
+  {"op":"scatter","count":n,"area":[x0,y0,x1,y1],"shape":<leaf op around the origin>}
+                 // stamps `count` copies of shape at random spots in area (e.g. a star field)
+  {"op":"repeat","nx":a,"ny":b,"dx":px,"dy":px,"x0":px,"y0":px,"shape":<leaf op around the origin>}
+                 // stamps shape across an a×b grid (e.g. windows, tiles)
 
 <color> is [r,g,b] or [r,g,b,a] (0-255), or one of the palette key strings
 "bg", "atmosphere", or "accent".
 
-Composition guidance (match the house style):
-- Use a gradient background, then build subjects from layered polygons + ellipses
-  with separate shadow / base / highlight layers.
-- Eyes: socket → iris → pupil → gleam.
-- Use a low-alpha layer of "grain" for texture, and finish with a "vignette" op.
+BE TOKEN-EFFICIENT — this matters:
+- NEVER enumerate many near-identical shapes by hand. For repetition use "scatter"
+  (random) or "repeat" (grid); for smooth curves use "bezier" (3-4 points) instead
+  of a long "points" list; for gradients use the gradient/radial background.
+- A scatter/repeat "shape" is defined around the origin (0,0) and is translated to
+  each placement — keep it small, e.g. {"op":"ellipse","bbox":[-2,-2,2,2],...}.
+- Aim for a compact scene: a few dozen ops is plenty. The expanding ops do the
+  heavy lifting so you write little.
 
-Hard limits: ≤ 64 layers, ≤ 5000 ops total, ≤ 2000 points per shape, grain count
-≤ 20000. Output raw JSON only — nothing before '{' or after '}'."""
+Composition guidance (match the house style):
+- Gradient or radial background, then build subjects from layered polygons +
+  ellipses with separate shadow / base / highlight layers.
+- Eyes: socket → iris → pupil → gleam. Use bezier for organic edges.
+- A low-alpha "scatter" or "grain" layer for texture; finish with a "vignette".
+
+Hard limits: ≤ 64 layers, ≤ 5000 ops, ≤ 2000 points/shape, ≤ 20000 expanded
+primitives total (scatter+repeat+grain). Output raw JSON only — nothing before
+'{' or after '}'."""
 
 def _strip_code_fences(text):
     """Enforce the 'raw Python only' output contract on the model's behalf.
