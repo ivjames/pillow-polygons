@@ -22,11 +22,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Run as an unprivileged user. The writable paths (DB, renders, uploads) are
-# supplied as mounted volumes/tmpfs at run time, so the image itself stays read-only.
+# Run as an unprivileged user. The writable paths (DB, renders) are supplied as
+# mounted volumes/tmpfs at run time, so the image itself stays read-only.
 RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin appuser \
- && mkdir -p /data /app/static/renders /app/static/uploads /jobs/incoming /jobs/done \
- && chown -R appuser:appuser /data /app/static/renders /app/static/uploads /jobs
+ && mkdir -p /data /app/static/renders /jobs/incoming /jobs/done \
+ && chown -R appuser:appuser /data /app/static/renders /jobs
 USER appuser
 
 ENV POLY_DB_PATH=/data/poly.db \

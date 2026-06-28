@@ -1,23 +1,20 @@
-import os, json, sqlite3, uuid, base64, sys
+import os, json, sqlite3, uuid, sys
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory, render_template, g, after_this_request
-from PIL import Image as PILImage
+from flask import Flask, request, jsonify, render_template, g
 import anthropic
 import anti_abuse
 
 # ── paths ──────────────────────────────────────────────────────────────────
-# RENDERS_DIR/UPLOADS_DIR stay under static/ (Flask serves them at /static/...);
-# in a hardened container, mount writable volumes at those paths. The DB isn't
-# served, so POLY_DB_PATH is env-overridable to a writable volume — this is what
-# lets the app run on a read-only root filesystem. Defaults preserve the local layout.
+# RENDERS_DIR stays under static/ (Flask serves it at /static/renders/...);
+# in a hardened container, mount a writable volume there. The DB isn't served,
+# so POLY_DB_PATH is env-overridable to a writable volume — this is what lets
+# the app run on a read-only root filesystem. Defaults preserve the local layout.
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 RENDERS_DIR = os.path.join(BASE_DIR, "static", "renders")
-UPLOADS_DIR = os.path.join(BASE_DIR, "static", "uploads")
 DB_PATH     = os.environ.get("POLY_DB_PATH") or os.path.join(BASE_DIR, "poly.db")
 RENDERER    = os.path.join(BASE_DIR, "renderer.py")
 
 os.makedirs(RENDERS_DIR, exist_ok=True)
-os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 # inject renderer into path
 sys.path.insert(0, BASE_DIR)
@@ -26,10 +23,12 @@ import sandbox
 import jobqueue
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB upload limit
+# Text-only API (no uploads): cap request bodies at 1MB — generate only carries a
+# prompt + a few small form fields, so anything larger is junk/abuse.
+app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 
-# anti-abuse setup: pins PIL.MAX_IMAGE_PIXELS and syncs MAX_CONTENT_LENGTH to
-# MAX_UPLOAD_MB. This is the module's only side-effecting call.
+# anti-abuse setup: pins PIL.MAX_IMAGE_PIXELS (decompression-bomb ceiling for the
+# renderer). This is the module's only side-effecting call.
 anti_abuse.init(app)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -138,10 +137,17 @@ init_db()
 # ── helpers ────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are the Pillow Polygons scene code generator.
 
-Given a user prompt (and optionally a reference image), output ONLY a Python code string — no markdown, no backticks, no explanation. Just raw Python drawing instructions.
+OUTPUT FORMAT — THIS IS A HARD REQUIREMENT:
+- Respond with raw Python source code and NOTHING else.
+- Do NOT wrap the code in markdown fences (no ``` or ```python).
+- Do NOT add any prose, explanation, comments-about-the-answer, or preamble
+  before or after the code. No "Here is..." and no closing remarks.
+- The FIRST character of your response must be the first character of Python
+  code, and the LAST character must be the last character of Python code.
+Any deviation from this format breaks the renderer.
 
 The following are pre-injected and available without importing:
-  img, draw, W, H, rng, ref, palette,
+  img, draw, W, H, rng, palette,
   Image, ImageDraw, ImageFont, math, random
 
 Rules:
@@ -160,7 +166,6 @@ Rules:
 - Use gradient backgrounds (scan line by line)
 - Build characters from polygons and ellipses with shadow/base/highlight layers
 - Eyes need socket → iris → pupil → gleam
-- If ref is provided, use ref.getpixel((x,y)) to sample dominant colors
 
 Available presets inject palette dict with keys: bg, atmosphere, accent, grain
 Always use palette.get('bg', (20,20,30)) style access — palette may be empty if no preset selected.
@@ -169,42 +174,37 @@ Available fonts (use try/except):
   /usr/share/fonts/truetype/google-fonts/Poppins-Bold.ttf
   /usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf
 
-Output raw Python only. Nothing else."""
+Remember the output format: raw Python only, no markdown fences, no prose. Nothing else."""
 
-def image_to_b64(path):
-    with open(path, "rb") as f:
-        return base64.standard_b64encode(f.read()).decode("utf-8")
+def _strip_code_fences(text):
+    """Enforce the 'raw Python only' output contract on the model's behalf.
 
-def call_claude(prompt, ref_path=None, preset=None, seed=42, model='claude-sonnet-4-6', ref_mime=None):
+    The system prompt demands no markdown, but models occasionally wrap the scene
+    code in a ```python ... ``` fence anyway. Rather than fail (and pay for a
+    retry), recover the code: if the response is fenced, drop the fence lines and
+    return the inner body. A response with no fence is returned unchanged.
+    """
+    s = (text or "").strip()
+    if not s.startswith("```"):
+        return s
+    lines = s.splitlines()
+    # Drop the opening fence (``` or ```python) ...
+    lines = lines[1:]
+    # ... and the closing fence if present.
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def call_claude(prompt, preset=None, seed=42, model='claude-sonnet-4-6'):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    user_content = []
-
-    if ref_path and os.path.exists(ref_path):
-        # Use the MIME detected by validate_image_upload (the real content type),
-        # falling back to extension only if a caller didn't supply one.
-        if ref_mime:
-            mime = ref_mime
-        else:
-            ext = ref_path.rsplit(".", 1)[-1].lower()
-            mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                    "png": "image/png", "gif": "image/gif",
-                    "webp": "image/webp"}.get(ext, "image/jpeg")
-        user_content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": mime,
-                "data": image_to_b64(ref_path)
-            }
-        })
 
     preset_note = f"\nActive preset: {preset}" if preset else ""
     seed_note   = f"\nSeed: {seed}"
-    user_content.append({
+    user_content = [{
         "type": "text",
         "text": f"{prompt}{preset_note}{seed_note}"
-    })
+    }]
 
     response = client.messages.create(
         model=model,
@@ -213,7 +213,9 @@ def call_claude(prompt, ref_path=None, preset=None, seed=42, model='claude-sonne
         messages=[{"role": "user", "content": user_content}]
     )
 
-    scene_code   = response.content[0].text.strip()
+    # Enforce the raw-Python output contract even if the model wrapped it in a
+    # markdown fence, so a stray ``` doesn't cost a syntax-error retry.
+    scene_code   = _strip_code_fences(response.content[0].text)
     tokens_in    = response.usage.input_tokens
     tokens_out   = response.usage.output_tokens
 
@@ -283,37 +285,9 @@ def generate():
     if verdict["action"] != "allow":
         return jsonify({"error": f"Prompt rejected: {verdict['reason']}"}), 400
 
-    # ── handle optional ref image: validate + sanitize, never trust the bytes ──
-    ref_path = None
-    ref_pil  = None
-    ref_mime = None
-    if "ref" in request.files and request.files["ref"].filename:
-        try:
-            clean = anti_abuse.validate_image_upload(request.files["ref"])
-        except anti_abuse.UploadRejected as e:
-            return jsonify({"error": e.message}), e.status
-        img_verdict = anti_abuse.moderate_image(clean.image, mod_client)
-        if img_verdict["action"] != "allow":
-            return jsonify({"error": f"Reference image rejected: {img_verdict['reason']}"}), 400
-        ref_name = f"{uuid.uuid4().hex}.{clean.ext}"
-        ref_path = os.path.join(UPLOADS_DIR, ref_name)
-        clean.save(ref_path)          # re-encoded, EXIF/polyglot stripped
-        ref_pil  = clean.image
-        ref_mime = clean.mime
-        # Delete the ref after the request finishes (no TTL sweep needed):
-        # uploads/ is otherwise write-only and never pruned.
-        @after_this_request
-        def _drop_ref(response, _p=ref_path):
-            try:
-                if os.path.exists(_p):
-                    os.remove(_p)
-            except OSError:
-                pass
-            return response
-
     model = request.form.get('model', 'claude-sonnet-4-6')
     try:
-        scene_code, tokens_in, tokens_out = call_claude(prompt, ref_path, preset, seed, model, ref_mime)
+        scene_code, tokens_in, tokens_out = call_claude(prompt, preset, seed, model)
     except Exception as e:
         return jsonify({"error": f"Claude API error: {e}"}), 500
 
@@ -328,8 +302,8 @@ def generate():
     syntax_err = check_syntax(scene_code)
     if syntax_err:
         try:
-            fix_prompt = f"The following Python scene code has a syntax error: {syntax_err}\n\nFix it and return only the corrected code, no explanation:\n\n{scene_code}"
-            scene_code, tokens_in2, tokens_out2 = call_claude(fix_prompt, None, preset, seed, model)
+            fix_prompt = f"The following Python scene code has a syntax error: {syntax_err}\n\nFix it and return ONLY the corrected raw Python code — no markdown fences, no explanation, no prose:\n\n{scene_code}"
+            scene_code, tokens_in2, tokens_out2 = call_claude(fix_prompt, preset, seed, model)
             tokens_in  += tokens_in2
             tokens_out += tokens_out2
         except Exception as e:
@@ -346,10 +320,11 @@ def generate():
         try:
             fix_prompt = (f"The following Python scene code was rejected by a security sandbox "
                           f"because: {safety_err}. Rewrite it to draw the same scene using ONLY "
-                          f"the pre-injected names (img, draw, W, H, rng, ref, palette, Image, "
+                          f"the pre-injected names (img, draw, W, H, rng, palette, Image, "
                           f"ImageDraw, ImageFont, math, random) with no imports, no dunder "
-                          f"attributes, and no eval/exec/open. Return only the corrected code:\n\n{scene_code}")
-            scene_code, tokens_in3, tokens_out3 = call_claude(fix_prompt, None, preset, seed, model)
+                          f"attributes, and no eval/exec/open. Return ONLY the corrected raw "
+                          f"Python code — no markdown fences, no explanation:\n\n{scene_code}")
+            scene_code, tokens_in3, tokens_out3 = call_claude(fix_prompt, preset, seed, model)
             tokens_in  += tokens_in3
             tokens_out += tokens_out3
         except Exception:

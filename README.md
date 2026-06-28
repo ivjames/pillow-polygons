@@ -1,7 +1,7 @@
 # Pillow Polygons
 
-A small Flask app that turns a text prompt (+ optional reference image) into
-polygon art. The prompt is sent to the Anthropic API, which returns Python
+A small Flask app that turns a text prompt into polygon art. The prompt is sent
+to the Anthropic API, which returns Python
 "scene code"; `renderer.py` executes that code with Pillow to draw the image.
 Results are stored in SQLite (`poly.db`) and written to `static/renders/`.
 
@@ -22,9 +22,9 @@ Abuse mitigations live in a self-contained module, `anti_abuse.py`, wired into
 | Area | What it does |
 |------|--------------|
 | **Rate limiting** | In-memory sliding-window per client IP. Strict cap on the expensive `POST /api/generate` (per-minute **and** per-day), looser cap on the cheap mutating endpoints. Returns `429` + `Retry-After`. |
-| **Upload abuse** | `validate_image_upload()` enforces a size cap, verifies the bytes are really an image (`Image.verify()`, format allowlist — **not** the filename), guards against decompression bombs (`MAX_IMAGE_PIXELS` + max dimension), then **re-encodes** to a clean image (strips EXIF/ICC/trailing data/polyglots). Uploaded refs are deleted after the request. |
+| **Text-only API** | The endpoint takes a prompt and a few small form fields — **no file uploads**. Request bodies are capped at 1MB, so there's no upload surface to abuse (no decompression bombs, polyglots, or EXIF tricks). |
 | **Spam / bots** | A hidden honeypot field, a signed+timestamped form token (rejects forged or impossibly-fast submissions), and an opt-in CAPTCHA hook (Cloudflare Turnstile). |
-| **NSFW / illegal** | An always-on keyword denylist for illegal categories (CSAM) blocks the prompt; an opt-in Claude classifier (prompt + reference image) adds NSFW/illegal screening. A visible policy notice + required acknowledgement checkbox gates every generate. |
+| **NSFW / illegal** | An always-on keyword denylist for illegal categories (CSAM) blocks the prompt; an opt-in Claude classifier screens the prompt text. A visible policy notice + required acknowledgement checkbox gates every generate. |
 
 Numeric inputs (`width`, `height`, `seed`) are parsed and clamped, so
 `seed=abc` no longer 500s and `width=999999` can't DoS the renderer.
@@ -46,8 +46,7 @@ All optional — defaults preserve current behavior for a single user.
 | `GENERATE_RATE_PER_MIN` | `5` | Max `/api/generate` calls per IP per minute. |
 | `GENERATE_RATE_PER_DAY` | `50` | Max `/api/generate` calls per IP per day. |
 | `MUTATE_RATE_PER_MIN` | `60` | Per-IP-per-minute cap on the mutating image/tag/folder endpoints. |
-| `MAX_UPLOAD_MB` | `16` | Max upload size (also sets Flask's `MAX_CONTENT_LENGTH`). |
-| `MODERATION_ENABLED` | unset (off) | When `1`, also run the Claude classifier on prompts (and reference images). Off by default so latency/cost are unchanged. |
+| `MODERATION_ENABLED` | unset (off) | When `1`, also run the Claude classifier on prompts. Off by default so latency/cost are unchanged. |
 | `CAPTCHA_SECRET` | unset (off) | Server-side Turnstile secret. When set, `/api/generate` requires a valid `captcha_token`. **Must be set together with `CAPTCHA_SITEKEY`** — otherwise the page renders no widget and every browser request fails. |
 | `CAPTCHA_SITEKEY` | unset | Client-side Turnstile site key. When set, the page renders the Turnstile widget and the JS sends its token as `captcha_token`. |
 | `FORM_TOKEN_SECRET` | random per-process | HMAC key for anti-bot form tokens. Set a stable value if you run >1 process or want tokens to survive restarts. |
@@ -137,7 +136,7 @@ Recorded here so the decision is explicit; not needed at single-user scale.
 ### CSAM detection is not real here
 
 The keyword denylist + LLM classifier in `anti_abuse.py` are a deterrent, **not**
-real CSAM detection. Any deployment that accepts third-party uploads at scale
-needs a hash-matching service (PhotoDNA / a cloud CSAI-match API) plus a
-mandated reporting path (e.g. NCMEC). This is marked as a `TODO` in the code,
-not faked.
+real CSAM detection. The API is text-only, so there's no uploaded-image surface;
+but any deployment serving generated imagery at scale still needs a real
+hash-matching service (PhotoDNA / a cloud CSAI-match API) plus a mandated
+reporting path (e.g. NCMEC). This is marked as a `TODO` in the code, not faked.

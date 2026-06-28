@@ -1,11 +1,11 @@
 """
 anti_abuse.py — self-contained abuse mitigations for Pillow Polygons.
 
-Covers the four areas the owner asked for:
+Covers the areas the owner asked for (the API is text-only — no uploads):
   1. Rate limiting / throttling           -> @rate_limit, generate_rate_limiters()
-  2. Upload / resource abuse              -> validate_image_upload(), safe_int()
-  3. Spam / bot submissions               -> honeypot + signed form-token + captcha hook
-  4. NSFW / illegal-image warning         -> moderate_prompt(), moderate_image()
+  2. Spam / bot submissions               -> honeypot + signed form-token + captcha hook
+  3. NSFW / illegal-content warning       -> moderate_prompt()
+  Input clamping for untrusted numerics   -> safe_int()
 
 Design constraints (see ANTI_ABUSE_TASK / README):
   - No heavy deps. Flask + Pillow + anthropic + stdlib only.
@@ -18,11 +18,10 @@ Optional upgrades intentionally NOT hard-required (left as comments):
   - Flask-Limiter + Redis for rate limits that share state across gunicorn workers.
   - Cloudflare Turnstile / hCaptcha for real bot defense (hook is wired below).
   - A real CSAM hash-matching service (PhotoDNA / cloud CSAI match) + a reporting
-    path. The keyword/model passes here are NOT a substitute for that — see §4.
+    path. The keyword/model passes here are NOT a substitute for that — see §3.
 """
 
 import os
-import io
 import time
 import hmac
 import hashlib
@@ -51,13 +50,11 @@ def _trust_proxy():            return _env_flag("TRUST_PROXY")
 def _generate_per_min():       return _env_int("GENERATE_RATE_PER_MIN", 5)
 def _generate_per_day():       return _env_int("GENERATE_RATE_PER_DAY", 50)
 def _mutate_per_min():         return _env_int("MUTATE_RATE_PER_MIN", 60)
-def _max_upload_bytes():       return _env_int("MAX_UPLOAD_MB", 16) * 1024 * 1024
 def _moderation_enabled():     return _env_flag("MODERATION_ENABLED")
 
-# Decompression-bomb / DoS guards.
+# Decompression-bomb ceiling for the renderer (the API is text-only, so this is
+# the only image surface left — a malicious scene that builds a giant canvas).
 MAX_IMAGE_PIXELS = 40_000_000       # ~6300x6300; Pillow raises DecompressionBombError above 2x this
-MAX_DIMENSION    = 8_000            # reject either side larger than this
-ALLOWED_FORMATS  = ("JPEG", "PNG", "GIF", "WEBP")
 
 # Numeric clamps for /api/generate.
 DIM_MIN, DIM_MAX   = 256, 2048
@@ -67,12 +64,10 @@ SEED_MIN, SEED_MAX = 0, 2_147_483_647
 def init(app):
     """Explicit, side-effecting setup. Call once from app.py after creating `app`.
 
-    - Pins Pillow's decompression-bomb ceiling.
-    - Syncs Flask's MAX_CONTENT_LENGTH to MAX_UPLOAD_MB (keeps the existing 16MB
-      default, but lets it be tuned by env).
+    Pins Pillow's decompression-bomb ceiling. (The request-body cap lives in
+    app.py — the API is text-only, so it's a fixed small limit, not upload-tied.)
     """
     Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-    app.config["MAX_CONTENT_LENGTH"] = _max_upload_bytes()
     return app
 
 
@@ -167,94 +162,7 @@ def mutate_rate_limit(fn):
     return rate_limit(_mutate_per_min(), 60, scope="mutate")(fn)
 
 
-# ── 2. upload / resource abuse ───────────────────────────────────────────────
-class UploadRejected(Exception):
-    """Raised when an upload fails validation. status is the HTTP code to return."""
-    def __init__(self, message, status=400):
-        super().__init__(message)
-        self.message = message
-        self.status = status
-
-
-# detected PIL format -> (output PIL format, file ext, mime)
-_FORMAT_OUT = {
-    "JPEG": ("JPEG", "jpg",  "image/jpeg"),
-    "PNG":  ("PNG",  "png",  "image/png"),
-    "GIF":  ("PNG",  "png",  "image/png"),   # flatten animated GIF to a single clean PNG
-    "WEBP": ("WEBP", "webp", "image/webp"),
-}
-
-
-class CleanImage:
-    """A validated, re-encoded upload. The caller persists it via .save(path)."""
-    def __init__(self, image, src_format, out_format, ext, mime):
-        self.image      = image        # PIL.Image in RGB, already re-encoded in memory
-        self.src_format = src_format   # what the bytes actually were
-        self.out_format = out_format   # PIL format we re-save as
-        self.ext        = ext          # real extension, e.g. "png"
-        self.mime       = mime         # real mime, e.g. "image/png"
-
-    def save(self, path):
-        kwargs = {}
-        if self.out_format == "JPEG":
-            kwargs["quality"] = 90
-        self.image.save(path, format=self.out_format, **kwargs)
-        return path
-
-
-def validate_image_upload(file_storage):
-    """Validate + sanitize an uploaded image. Returns CleanImage or raises UploadRejected.
-
-    Steps: size cap -> integrity verify -> format allowlist (NOT the filename) ->
-    decompression-bomb guard -> dimension cap -> re-encode (strips EXIF/ICC/
-    trailing data/polyglots). We never persist the raw uploaded bytes.
-    """
-    raw = file_storage.read()
-    if not raw:
-        raise UploadRejected("Empty upload.")
-    if len(raw) > _max_upload_bytes():
-        raise UploadRejected(
-            f"Image too large (max {_max_upload_bytes() // (1024 * 1024)}MB).", status=413
-        )
-
-    # 1) integrity check — .verify() detects truncated/corrupt files but leaves
-    #    the image unusable afterward, so we re-open from the same bytes below.
-    try:
-        Image.open(io.BytesIO(raw)).verify()
-    except Image.DecompressionBombError:
-        raise UploadRejected("Image rejected: decompression bomb.")
-    except Exception:
-        raise UploadRejected("Not a valid image file.")
-
-    # 2) re-open for real (and for metadata) — trust the decoded format, never the name.
-    try:
-        img = Image.open(io.BytesIO(raw))
-        img.load()
-    except Image.DecompressionBombError:
-        raise UploadRejected("Image rejected: decompression bomb.")
-    except Exception:
-        raise UploadRejected("Not a valid image file.")
-
-    fmt = (img.format or "").upper()
-    if fmt not in ALLOWED_FORMATS:
-        raise UploadRejected(
-            f"Unsupported image type ({fmt or 'unknown'}). Allowed: JPEG, PNG, GIF, WEBP."
-        )
-
-    w, h = img.size
-    if w > MAX_DIMENSION or h > MAX_DIMENSION:
-        raise UploadRejected(
-            f"Image too large in pixels ({w}x{h}); max {MAX_DIMENSION}px per side."
-        )
-
-    # 3) re-encode to a clean image (flattens to RGB, dropping EXIF/ICC/alpha/
-    #    trailing bytes and any polyglot payload).
-    out_format, ext, mime = _FORMAT_OUT[fmt]
-    clean = img.convert("RGB")
-    return CleanImage(clean, src_format=fmt, out_format=out_format, ext=ext, mime=mime)
-
-
-# ── 3. spam / bot submissions ────────────────────────────────────────────────
+# ── 2. spam / bot submissions ────────────────────────────────────────────────
 HONEYPOT_FIELD = "website"   # hidden in the UI; humans never fill it, bots often do
 _FORM_TOKEN_MIN_AGE = 2      # seconds — submissions faster than this are bots
 _FORM_TOKEN_MAX_AGE = 12 * 60 * 60  # 12h — generous so a long-open tab still works
@@ -336,7 +244,7 @@ def verify_captcha(token):
         return False
 
 
-# ── 4. NSFW / illegal-image moderation ───────────────────────────────────────
+# ── 3. NSFW / illegal-content moderation ─────────────────────────────────────
 # Cheap, always-on first pass: an illegal-category keyword denylist focused on
 # CSAM. These terms are never part of legitimate single-user art prompts, so
 # blocking them does not change behavior for real users. This is deliberately
@@ -344,11 +252,11 @@ def verify_captcha(token):
 #
 # !!! HONEST LIMITATION !!!
 # A keyword list + an LLM classifier is NOT real CSAM detection and must not be
-# treated as one. Any deployment that accepts third-party uploads at scale needs
-# a hash-matching service (PhotoDNA / a cloud CSAI-match API) plus a mandated
-# reporting path (e.g. NCMEC).
-# TODO: integrate a real CSAM hash-match + reporting pipeline before opening
-#       uploads to the public.
+# treated as one. The API is text-only (no uploads), but any deployment serving
+# generated imagery at scale still needs a hash-matching service (PhotoDNA / a
+# cloud CSAI-match API) plus a mandated reporting path (e.g. NCMEC).
+# TODO: integrate a real CSAM hash-match + reporting pipeline before serving
+#       generated content to the public at scale.
 _CSAM_PHRASES = (
     "child porn", "child pornography", "childporn", "csam", "cp video",
     "preteen sex", "pedophilia", "pedophile", "lolicon", "shotacon",
@@ -411,38 +319,3 @@ def moderate_prompt(text, client=None):
     if _moderation_enabled() and client is not None:
         return _model_classify_text(text, client)
     return verdict
-
-
-def moderate_image(pil_image, client=None):
-    """Moderate an uploaded reference image via Claude vision. No-op (allow) unless
-    MODERATION_ENABLED=1 and a client is supplied. Fails OPEN on API errors."""
-    if not _moderation_enabled() or client is None or pil_image is None:
-        return _allow()
-    try:
-        import base64
-        buf = io.BytesIO()
-        pil_image.convert("RGB").save(buf, format="JPEG", quality=80)
-        b64 = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
-        resp = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=20,
-            system=(
-                "You are a content-safety classifier for an uploaded reference image. "
-                "Reply with exactly one word: SAFE, NSFW, or ILLEGAL. "
-                "ILLEGAL = sexual content involving minors or other clearly illegal "
-                "imagery. NSFW = adult sexual/explicit content. SAFE = everything else."
-            ),
-            messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64",
-                 "media_type": "image/jpeg", "data": b64}},
-                {"type": "text", "text": "Classify this image."},
-            ]}],
-        )
-        verdict = resp.content[0].text.strip().upper()
-        if "ILLEGAL" in verdict:
-            return _block("Reference image flagged as illegal content.")
-        if "NSFW" in verdict:
-            return _flag("Reference image flagged as NSFW.")
-        return _allow()
-    except Exception:
-        return _allow()

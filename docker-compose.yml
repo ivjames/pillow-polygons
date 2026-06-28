@@ -40,7 +40,6 @@ services:
       TRUST_PROXY: "1"
       GENERATE_RATE_PER_MIN: "5"
       GENERATE_RATE_PER_DAY: "50"
-      MAX_UPLOAD_MB: "16"
 
     ports:
       - "127.0.0.1:8040:8040"
@@ -57,7 +56,6 @@ services:
 
     tmpfs:
       - /tmp
-      - /app/static/uploads:uid=10001,gid=10001   # refs are deleted post-request
     volumes:
       - poly-data:/data                            # SQLite DB (persistent)
       - poly-renders:/app/static/renders           # gallery output (read for serving)
