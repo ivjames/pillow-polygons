@@ -1,0 +1,9 @@
+.git
+__pycache__/
+*.pyc
+*.db
+.env
+venv/
+static/renders/*
+static/uploads/*
+ecosystem.config.js

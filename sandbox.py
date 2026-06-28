@@ -26,12 +26,34 @@ All limits are env-tunable; defaults are generous enough for legitimate scenes.
 import io
 import os
 import multiprocessing as mp
+import threading
 
 
 def _cpu_seconds():  return int(os.environ.get("RENDER_CPU_SECONDS", 10))
 def _mem_mb():       return int(os.environ.get("RENDER_MEM_MB", 1024))
 def _wall_seconds(): return int(os.environ.get("RENDER_WALL_SECONDS", 20))
 def _fsize_mb():     return int(os.environ.get("RENDER_FSIZE_MB", 64))
+def _concurrency():  return max(1, int(os.environ.get("RENDER_CONCURRENCY", 1)))
+
+
+# Bound how many render subprocesses run at once. With gunicorn --threads N, up
+# to N requests can reach run_scene() concurrently; without this, K simultaneous
+# renders could each allocate up to RENDER_MEM_MB and blow past the container
+# memory cap, getting the whole web process OOM-killed instead of the per-render
+# rlimit returning a controlled error. Default 1 (serialize) keeps the worst-case
+# render footprint at a single RENDER_MEM_MB, so size the container at
+# RENDER_MEM_MB * RENDER_CONCURRENCY + headroom (see DEPLOY.md).
+_render_sema = None
+_sema_lock = threading.Lock()
+
+
+def _semaphore():
+    global _render_sema
+    if _render_sema is None:
+        with _sema_lock:
+            if _render_sema is None:
+                _render_sema = threading.BoundedSemaphore(_concurrency())
+    return _render_sema
 
 
 class RenderTimeout(Exception):
@@ -95,26 +117,29 @@ def run_scene(scene_code, ref=None, **kwargs):
         ref.convert("RGB").save(buf, format="PNG")
         ref_png = buf.getvalue()
 
-    # fork keeps startup cheap and inherits the already-imported PIL/renderer.
-    ctx = mp.get_context("fork")
-    q = ctx.Queue()
-    proc = ctx.Process(target=_child, args=(q, scene_code, kwargs, ref_png), daemon=True)
-    proc.start()
-    proc.join(_wall_seconds())
+    # Serialize concurrent renders (default 1) so their combined memory ceiling
+    # stays bounded and the per-render rlimit trips before the container OOMs.
+    with _semaphore():
+        # fork keeps startup cheap and inherits the already-imported PIL/renderer.
+        ctx = mp.get_context("fork")
+        q = ctx.Queue()
+        proc = ctx.Process(target=_child, args=(q, scene_code, kwargs, ref_png), daemon=True)
+        proc.start()
+        proc.join(_wall_seconds())
 
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(5)
         if proc.is_alive():
-            proc.kill()
-            proc.join()
-        raise RenderTimeout(f"render exceeded {_wall_seconds()}s and was killed")
+            proc.terminate()
+            proc.join(5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
+            raise RenderTimeout(f"render exceeded {_wall_seconds()}s and was killed")
 
-    try:
-        status, payload = q.get(timeout=2)
-    except Exception:
-        # No message => the child died hard (segfault, SIGKILL from OOM/SIGXCPU).
-        raise RenderError(f"render process died (exit code {proc.exitcode})")
+        try:
+            status, payload = q.get(timeout=2)
+        except Exception:
+            # No message => the child died hard (segfault, SIGKILL from OOM/SIGXCPU).
+            raise RenderError(f"render process died (exit code {proc.exitcode})")
 
     if status == "ok":
         return payload

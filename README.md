@@ -48,6 +48,7 @@ All optional — defaults preserve current behavior for a single user.
 | `RENDER_MEM_MB` | `1024` | Address-space (memory) limit for the render subprocess. |
 | `RENDER_WALL_SECONDS` | `20` | Wall-clock timeout; a render exceeding it is killed. |
 | `RENDER_FSIZE_MB` | `64` | Max output file size the render subprocess may write. |
+| `RENDER_CONCURRENCY` | `1` | Max simultaneous render subprocesses. Keeps worst-case render memory at one `RENDER_MEM_MB` (vs. `threads × RENDER_MEM_MB`); size the container memory accordingly. |
 
 ### Optional upgrades (not hard-required)
 

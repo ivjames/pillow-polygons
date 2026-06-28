@@ -1,0 +1,74 @@
+# Hardened run-time configuration for Pillow Polygons.
+#
+# Security layering (see DEPLOY.md):
+#   app level   — AST allowlist + restricted builtins + subprocess rlimits (in code)
+#   container   — everything below: non-root, read-only rootfs, dropped caps,
+#                 no-new-privileges, default seccomp, CPU/memory/PID limits
+#
+# Publishes only to 127.0.0.1 — put a TLS reverse proxy (Caddy/nginx) in front
+# and set TRUST_PROXY=1 so per-IP rate limits use the real client IP.
+
+services:
+  web:
+    build: .
+    image: pillow-polygons:latest
+    restart: unless-stopped
+
+    # Reap any orphaned render subprocesses (PID 1 init).
+    init: true
+
+    env_file:
+      - .env            # ANTHROPIC_API_KEY=... (see .env.example)
+    environment:
+      POLY_DB_PATH: /data/poly.db
+      # Anti-abuse knobs (all optional; these are the defaults made explicit):
+      TRUST_PROXY: "1"            # we publish behind a reverse proxy
+      GENERATE_RATE_PER_MIN: "5"
+      GENERATE_RATE_PER_DAY: "50"
+      MAX_UPLOAD_MB: "16"
+      # Sandbox resource limits for the render subprocess:
+      RENDER_CPU_SECONDS: "10"
+      RENDER_MEM_MB: "1024"
+      RENDER_WALL_SECONDS: "20"
+      RENDER_FSIZE_MB: "64"
+      # Serialize renders so worst-case render memory is a single RENDER_MEM_MB,
+      # not (threads x RENDER_MEM_MB). Keep mem_limit >= RENDER_MEM_MB *
+      # RENDER_CONCURRENCY + ~512MiB headroom so the per-render rlimit returns a
+      # controlled error before the container OOM-kills the web process.
+      RENDER_CONCURRENCY: "1"
+
+    ports:
+      - "127.0.0.1:8040:8040"
+
+    # ── container hardening ──────────────────────────────────────────────
+    user: "10001:10001"
+    read_only: true                 # root filesystem is immutable
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      # Docker's default seccomp profile is applied automatically and blocks the
+      # dangerous syscalls. A stricter, network-less allowlist for a dedicated
+      # render worker lives in seccomp/render-worker.json (roadmap — see issue #2).
+    pids_limit: 256
+    mem_limit: 1536m                  # >= RENDER_MEM_MB(1024) * RENDER_CONCURRENCY(1) + headroom
+    cpus: "2.0"
+
+    # ── writable surfaces (everything else is read-only) ─────────────────
+    tmpfs:
+      - /tmp
+      - /app/static/uploads:uid=10001,gid=10001   # refs are deleted post-request
+    volumes:
+      - poly-data:/data                            # SQLite DB (persistent)
+      - poly-renders:/app/static/renders           # gallery output (persistent)
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8040/api/tags', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  poly-data:
+  poly-renders:

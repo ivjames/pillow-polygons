@@ -1,0 +1,45 @@
+{
+  "_comment": [
+    "DRAFT seccomp profile for a NETWORK-LESS render worker (roadmap, issue #2).",
+    "This is deny-by-default (SCMP_ACT_ERRNO): only the listed syscalls are allowed,",
+    "and networking syscalls (socket/connect/bind/sendto/...) are deliberately omitted,",
+    "so scene code cannot open a network connection even via a future syscall path.",
+    "",
+    "It is intended for a dedicated render service that ONLY runs renderer.render() —",
+    "NOT for the web container, which needs sockets to serve HTTP and call the Anthropic",
+    "API. Until rendering is split into its own service (issue #2), the web container",
+    "should keep Docker's DEFAULT seccomp profile (applied automatically).",
+    "",
+    "Curated for CPython 3.12 + Pillow on x86_64. TEST under your exact kernel/arch",
+    "(strace the worker, add any EPERM/ENOSYS syscalls it actually needs) before",
+    "relying on it. Apply with: security_opt: [seccomp:./seccomp/render-worker.json]."
+  ],
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "archMap": [
+    { "architecture": "SCMP_ARCH_X86_64", "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"] },
+    { "architecture": "SCMP_ARCH_AARCH64", "subArchitectures": ["SCMP_ARCH_ARM"] }
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "read", "write", "readv", "writev", "pread64", "pwrite64", "lseek",
+        "open", "openat", "close", "close_range", "dup", "dup2", "dup3",
+        "stat", "fstat", "lstat", "newfstatat", "statx", "fstatfs", "statfs",
+        "access", "faccessat", "faccessat2", "readlink", "readlinkat", "getcwd",
+        "getdents64", "fcntl", "ioctl", "pipe", "pipe2", "fchmod", "umask",
+        "mmap", "munmap", "mprotect", "mremap", "madvise", "brk", "mlock", "munlock",
+        "rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "sigaltstack",
+        "clone", "clone3", "set_robust_list", "get_robust_list", "futex", "futex_waitv",
+        "set_tid_address", "gettid", "getpid", "getppid",
+        "exit", "exit_group", "wait4", "waitid", "kill", "tgkill",
+        "nanosleep", "clock_nanosleep", "clock_gettime", "gettimeofday", "times",
+        "getuid", "geteuid", "getgid", "getegid", "getrandom",
+        "getrlimit", "setrlimit", "prlimit64", "getrusage",
+        "sysinfo", "sched_getaffinity", "sched_yield", "arch_prctl", "prctl",
+        "uname", "rseq", "epoll_create1", "epoll_ctl", "epoll_wait", "eventfd2",
+        "memfd_create", "ftruncate", "truncate", "unlink", "unlinkat", "rename", "renameat2"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}
