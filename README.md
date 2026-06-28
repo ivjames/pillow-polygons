@@ -41,8 +41,13 @@ All optional — defaults preserve current behavior for a single user.
 | `MUTATE_RATE_PER_MIN` | `60` | Per-IP-per-minute cap on the mutating image/tag/folder endpoints. |
 | `MAX_UPLOAD_MB` | `16` | Max upload size (also sets Flask's `MAX_CONTENT_LENGTH`). |
 | `MODERATION_ENABLED` | unset (off) | When `1`, also run the Claude classifier on prompts (and reference images). Off by default so latency/cost are unchanged. |
-| `CAPTCHA_SECRET` | unset (off) | When set, `/api/generate` requires a valid Cloudflare Turnstile token (`captcha_token`). Unset = CAPTCHA disabled. |
+| `CAPTCHA_SECRET` | unset (off) | Server-side Turnstile secret. When set, `/api/generate` requires a valid `captcha_token`. **Must be set together with `CAPTCHA_SITEKEY`** — otherwise the page renders no widget and every browser request fails. |
+| `CAPTCHA_SITEKEY` | unset | Client-side Turnstile site key. When set, the page renders the Turnstile widget and the JS sends its token as `captcha_token`. |
 | `FORM_TOKEN_SECRET` | random per-process | HMAC key for anti-bot form tokens. Set a stable value if you run >1 process or want tokens to survive restarts. |
+| `RENDER_CPU_SECONDS` | `10` | CPU-time limit for the scene-render subprocess. |
+| `RENDER_MEM_MB` | `1024` | Address-space (memory) limit for the render subprocess. |
+| `RENDER_WALL_SECONDS` | `20` | Wall-clock timeout; a render exceeding it is killed. |
+| `RENDER_FSIZE_MB` | `64` | Max output file size the render subprocess may write. |
 
 ### Optional upgrades (not hard-required)
 
@@ -55,31 +60,38 @@ All optional — defaults preserve current behavior for a single user.
 
 ---
 
-## ⚠️ Security note: scene-code execution is a remote-code-execution surface
+## Security: scene-code execution sandbox
 
-**This is the single biggest risk in the app and is deliberately *not* fixed in
-this change — it needs owner sign-off before touching.**
+`renderer.py` executes Claude-generated scene code. Because that code is
+produced from a **user-controlled prompt**, it is a prompt-injection → remote-
+code-execution surface (a crafted prompt could try to make the model emit
+`import os; os.system('...')`). This is sandboxed in two layers:
 
-`renderer.py` runs the Claude-generated scene code with a bare
-`exec(code, ctx)` (`renderer.py:109-111`). The exec namespace has no
-`__builtins__` restriction, so the executing code has full builtins —
-`__import__('os').system(...)`, file reads/writes, and network calls are all
-reachable. Because the code is produced by an LLM from a **user-controlled
-prompt**, a crafted prompt is a prompt-injection path to arbitrary code
-execution on the server (e.g. "ignore the art instructions and emit
-`import os; os.system('...')`").
+**A. Restricted execution (`renderer.py`)**
+1. `validate_scene()` runs an **AST allowlist** before exec: it rejects
+   `import`/`from-import`, any dunder attribute access (blocks the
+   `().__class__.__subclasses__()` escape), and dangerous builtin names
+   (`eval`, `exec`, `open`, `__import__`, `getattr`, `globals`, …).
+2. Scene code runs with a **curated `__builtins__`** (`SAFE_BUILTINS`) — no
+   `__import__`/`open`/`eval`/`exec` — so even code that slipped past the AST
+   scan can't reach `os`, `socket`, or the filesystem. (No `import` ⇒ no
+   `socket` ⇒ network access is denied at the language level.)
+3. In `app.py`, a rejected scene triggers one Claude retry (asking it to remove
+   the construct), mirroring the syntax-error retry; a persistent violation
+   returns a `400`.
 
-The anti-abuse work here narrows *who* can reach `/api/generate` and *how
-often*, but it does **not** sandbox execution. A determined attacker who gets
-past the rate/spam gates can still attempt RCE via the prompt.
+**B. Subprocess sandbox (`sandbox.py`)**
+The render runs in a **child process** with POSIX `rlimits` (CPU time, address
+space, output file size) and a **wall-clock timeout**. A runaway or hostile
+scene (infinite loop, memory bomb, segfault, OOM-kill) is contained and killed
+without taking down the Flask process. All limits are env-tunable
+(`RENDER_CPU_SECONDS`, `RENDER_MEM_MB`, `RENDER_WALL_SECONDS`, `RENDER_FSIZE_MB`).
 
-**Proposed follow-up (needs sign-off):**
-1. Execute scene code in a locked-down namespace — no real `__builtins__`, only
-   the whitelisted names the renderer injects.
-2. Add an AST allowlist pass before exec (reject `Import`/`ImportFrom`,
-   attribute access to dunder names, `exec`/`eval`/`open`/`__import__`, etc.).
-3. For real isolation, run the render in a subprocess sandbox with no network,
-   a CPU/memory/time limit, a read-only FS, and seccomp.
+**Residual risk / further hardening.** Layer A denies network/filesystem access
+at the language level, but kernel-level isolation (a seccomp syscall filter, a
+network namespace, a read-only root FS) needs root or a container and is a
+deployment concern. For production, also run the render child inside a
+locked-down container/netns. This is noted as a `TODO` in `sandbox.py`.
 
 ### CSAM detection is not real here
 

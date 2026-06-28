@@ -125,6 +125,9 @@ async function generate() {
   fd.append("ack",        $("ack-checkbox").checked ? "1" : "");
   fd.append("form_token", $("form-token").value);
   fd.append("website",    $("website").value);   // honeypot (stays empty for humans)
+  // Turnstile token, only present when CAPTCHA_SITEKEY is configured server-side.
+  const captcha = document.querySelector('[name="cf-turnstile-response"]');
+  if (captcha) fd.append("captcha_token", captcha.value);
   if (refFile) fd.append("ref", refFile);
 
   try {

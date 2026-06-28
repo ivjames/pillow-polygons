@@ -5,10 +5,82 @@ Outputs PNG + SVG twin + JSON sidecar + thumbnail.
 """
 
 from PIL import Image, ImageDraw, ImageFont
-import math, random, sys, os, json
+import ast, math, random, sys, os, json
 from datetime import datetime
 
 OUTPUT_DIR = "/mnt/user-data/outputs"
+
+
+# ── scene-code sandbox, part A: static validation + restricted builtins ──────
+# Claude-generated scene code is executed (see _exec_code). Because the code is
+# produced from a user-controlled prompt, that is a prompt-injection -> RCE
+# surface. Part A locks down *what the code can do*; sandbox.py (part B) locks
+# down *what resources it can consume* by running this in a subprocess.
+#
+# Defense 1: an AST allowlist that rejects imports, dunder access (the usual
+#   `().__class__.__subclasses__()` escape), and dangerous builtin names.
+# Defense 2: exec with a curated __builtins__ — no __import__/open/eval/exec, so
+#   even code that slips past the AST scan can't reach os/socket/filesystem.
+
+class SceneValidationError(Exception):
+    """Raised when scene code uses a construct the sandbox forbids."""
+
+
+# Builtin *names* that must never appear in scene code.
+_DENIED_NAMES = frozenset({
+    "eval", "exec", "compile", "open", "__import__", "input", "breakpoint",
+    "globals", "locals", "vars", "getattr", "setattr", "delattr", "hasattr",
+    "memoryview", "help", "exit", "quit", "copyright", "credits", "license",
+})
+
+# The only builtins scene code is allowed to use. No __import__/open/eval/exec.
+_SAFE_BUILTIN_NAMES = (
+    "abs", "all", "any", "bool", "bytearray", "bytes", "chr", "complex", "dict",
+    "divmod", "enumerate", "filter", "float", "format", "frozenset", "hex", "int",
+    "isinstance", "issubclass", "iter", "len", "list", "map", "max", "min", "next",
+    "ord", "pow", "print", "range", "repr", "reversed", "round", "set", "slice",
+    "sorted", "str", "sum", "tuple", "zip",
+    # exceptions scene code may reference (the prompt tells it to use try/except)
+    "Exception", "ValueError", "TypeError", "KeyError", "IndexError", "OSError",
+    "IOError", "AttributeError", "ZeroDivisionError", "RuntimeError", "StopIteration",
+    "True", "False", "None",
+)
+
+
+def _build_safe_builtins():
+    import builtins
+    safe = {}
+    for name in _SAFE_BUILTIN_NAMES:
+        if hasattr(builtins, name):
+            safe[name] = getattr(builtins, name)
+    return safe
+
+
+SAFE_BUILTINS = _build_safe_builtins()
+
+
+def validate_scene(code):
+    """Static-analyze one scene-code string. Returns an error string if it uses a
+    forbidden construct, else None. Cheap enough to run before exec (and to gate
+    a Claude retry on, like the syntax check)."""
+    if not isinstance(code, str):
+        return "scene code must be a string"
+    try:
+        tree = ast.parse(code, "<scene>", "exec")
+    except SyntaxError as e:
+        return f"syntax error: {e}"
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return "imports are not allowed in scene code"
+        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+            # blocks __class__, __globals__, __subclasses__, __builtins__, etc.
+            return f"access to attribute '{node.attr}' is not allowed"
+        if isinstance(node, ast.Name):
+            if node.id in _DENIED_NAMES:
+                return f"use of '{node.id}' is not allowed"
+            if node.id.startswith("__") and node.id.endswith("__"):
+                return f"use of '{node.id}' is not allowed"
+    return None
 
 PRESETS = {
     "night":  {"bg": (8,10,22),   "atmosphere": (15,20,45,60),  "accent": (180,210,255), "grain": 3000},
@@ -107,6 +179,12 @@ def _make_canvas(width, height, preset=None):
 
 
 def _exec_code(code, ctx):
+    # Validate before executing, then run with a restricted __builtins__ so the
+    # code can't import os/socket or reach open/eval/exec. (Belt-and-suspenders
+    # with sandbox.py's subprocess + rlimits.)
+    err = validate_scene(code)
+    if err:
+        raise SceneValidationError(err)
     exec(code, ctx)
     return ctx["img"]
 
@@ -144,6 +222,9 @@ def render(
     palette   = {**_base_palette, **(PRESETS.get(preset, {}) if preset else {})}
 
     ctx = {
+        # Restricted builtins: no __import__/open/eval/exec/getattr. This replaces
+        # the implicit full builtins that a bare exec(code, {}) would inject.
+        "__builtins__": SAFE_BUILTINS,
         "img":       img,
         "draw":      draw,
         "svg":       svg_rec,

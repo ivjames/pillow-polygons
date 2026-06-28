@@ -17,7 +17,8 @@ os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 # inject renderer into path
 sys.path.insert(0, BASE_DIR)
-from renderer import render as poly_render
+from renderer import render as poly_render, validate_scene as renderer_validate, SceneValidationError
+import sandbox
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB upload limit
@@ -181,7 +182,11 @@ def row_to_dict(row):
 def index():
     # Issue a signed, timestamped form token embedded in the page. The generate
     # endpoint rejects submissions with a missing/forged/too-fast token.
-    return render_template("index.html", form_token=anti_abuse.make_form_token())
+    # CAPTCHA_SITEKEY drives the client-side Turnstile widget; it must be set
+    # alongside CAPTCHA_SECRET (server) for CAPTCHA to work in a browser.
+    return render_template("index.html",
+                           form_token=anti_abuse.make_form_token(),
+                           captcha_sitekey=os.environ.get("CAPTCHA_SITEKEY", ""))
 
 # ── routes: generation ─────────────────────────────────────────────────────
 @app.route("/api/generate", methods=["POST"])
@@ -214,10 +219,12 @@ def generate():
         return jsonify({"error": "CAPTCHA verification failed."}), 400
 
     # ── prompt moderation (keyword always; model pass if MODERATION_ENABLED) ──
+    # The content policy prohibits NSFW *and* illegal content, so any non-"allow"
+    # verdict (both "block" and the softer "flag"=NSFW) is rejected.
     mod_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
     verdict = anti_abuse.moderate_prompt(prompt, mod_client)
-    if verdict["action"] == "block":
-        return jsonify({"error": f"Prompt blocked: {verdict['reason']}"}), 400
+    if verdict["action"] != "allow":
+        return jsonify({"error": f"Prompt rejected: {verdict['reason']}"}), 400
 
     # ── handle optional ref image: validate + sanitize, never trust the bytes ──
     ref_path = None
@@ -229,8 +236,8 @@ def generate():
         except anti_abuse.UploadRejected as e:
             return jsonify({"error": e.message}), e.status
         img_verdict = anti_abuse.moderate_image(clean.image, mod_client)
-        if img_verdict["action"] == "block":
-            return jsonify({"error": f"Reference image blocked: {img_verdict['reason']}"}), 400
+        if img_verdict["action"] != "allow":
+            return jsonify({"error": f"Reference image rejected: {img_verdict['reason']}"}), 400
         ref_name = f"{uuid.uuid4().hex}.{clean.ext}"
         ref_path = os.path.join(UPLOADS_DIR, ref_name)
         clean.save(ref_path)          # re-encoded, EXIF/polyglot stripped
@@ -274,17 +281,43 @@ def generate():
         if syntax_err2:
             return jsonify({"error": f"Syntax error persisted after retry: {syntax_err2}", "scene_code": scene_code}), 500
 
-    # render
+    # sandbox safety check — reject scene code that uses forbidden constructs
+    # (imports, dunder access, os/eval/exec, etc.). Retry once asking Claude to
+    # remove them, since an occasional model slip shouldn't fail a legit prompt.
+    safety_err = renderer_validate(scene_code)
+    if safety_err:
+        try:
+            fix_prompt = (f"The following Python scene code was rejected by a security sandbox "
+                          f"because: {safety_err}. Rewrite it to draw the same scene using ONLY "
+                          f"the pre-injected names (img, draw, W, H, rng, ref, palette, Image, "
+                          f"ImageDraw, ImageFont, math, random) with no imports, no dunder "
+                          f"attributes, and no eval/exec/open. Return only the corrected code:\n\n{scene_code}")
+            scene_code, tokens_in3, tokens_out3 = call_claude(fix_prompt, None, preset, seed, model)
+            tokens_in  += tokens_in3
+            tokens_out += tokens_out3
+        except Exception:
+            return jsonify({"error": f"Scene rejected by sandbox: {safety_err}"}), 400
+        safety_err2 = renderer_validate(scene_code)
+        if safety_err2:
+            return jsonify({"error": f"Scene rejected by sandbox: {safety_err2}", "scene_code": scene_code}), 400
+
+    # render — executed in a resource-limited subprocess sandbox (sandbox.py)
     img_id   = uuid.uuid4().hex
     filename = f"{img_id}.png"
 
     try:
-        result = poly_render(
+        result = sandbox.run_scene(
             scene_code, filename=filename,
             width=width, height=height, seed=seed,
             ref=ref_pil, preset=preset, thumbnail=True,
             _output_dir=RENDERS_DIR
         )
+    except SceneValidationError as e:
+        return jsonify({"error": f"Scene rejected by sandbox: {e}", "scene_code": scene_code}), 400
+    except sandbox.RenderTimeout as e:
+        return jsonify({"error": f"Render timed out: {e}"}), 400
+    except sandbox.RenderError as e:
+        return jsonify({"error": f"Render error: {e}", "scene_code": scene_code}), 500
     except Exception as e:
         return jsonify({"error": f"Render error: {e}", "scene_code": scene_code}), 500
 
