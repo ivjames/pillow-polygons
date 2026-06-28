@@ -29,6 +29,13 @@ Abuse mitigations live in a self-contained module, `anti_abuse.py`, wired into
 Numeric inputs (`width`, `height`, `seed`) are parsed and clamped, so
 `seed=abc` no longer 500s and `width=999999` can't DoS the renderer.
 
+**Cost visibility.** Every generation records the model used and reports a
+`cost_usd` (derived from the model's list price × token counts; see `PRICING` /
+`compute_cost` in `app.py`). It's returned from `/api/generate` and `/api/images`
+and shown in the UI's token meter, so per-render Anthropic spend is visible at a
+glance. The `model` column auto-migrates onto existing databases; legacy rows
+with no recorded model price at the Sonnet tier.
+
 ### Environment variables
 
 All optional — defaults preserve current behavior for a single user.
@@ -73,7 +80,11 @@ code-execution surface (a crafted prompt could try to make the model emit
 **A. Restricted execution (`renderer.py`)**
 1. `validate_scene()` runs an **AST allowlist** before exec: it rejects
    `import`/`from-import`, any dunder attribute access (blocks the
-   `().__class__.__subclasses__()` escape), and dangerous builtin names
+   `().__class__.__subclasses__()` escape), the **frame/generator/coroutine
+   introspection attributes** (`gi_frame`, `f_back`, `f_globals`, `cr_frame`, …
+   — the non-dunder escape where a running generator's frame walks out to
+   `f_globals['os']`), `str.format`/`format_map` (which traverse attributes named
+   inside a format-string literal the AST can't see), and dangerous builtin names
    (`eval`, `exec`, `open`, `__import__`, `getattr`, `globals`, …).
 2. Scene code runs with a **curated `__builtins__`** (`SAFE_BUILTINS`) — no
    `__import__`/`open`/`eval`/`exec` — so even code that slipped past the AST
@@ -100,6 +111,28 @@ jobs to the worker over a shared filesystem queue (`jobqueue.py` /
 and no access to the web tier or its API key. Set `RENDER_MODE=local` (the
 default) to run the in-process sandbox instead — used for development and tests.
 See `DEPLOY.md`.
+
+> **The in-language allowlist is a speed bump, not a boundary.** CPython
+> introspection is bypassable in principle — one escape class (the generator
+> frame walk) was already found and fixed. Layer A exists to make casual escapes
+> hard and to fail a slipped model output fast; the controls that actually
+> *hold* a determined attacker are Layer B (resource limits) and Layer C (no
+> network + seccomp + read-only rootfs). Treat A as defense-in-depth, not the wall.
+
+### Stronger isolation if this takes real public traffic
+
+The current jail (layers A–C) contains an attacker who reaches `os`/`socket`:
+no network, no caps, read-only FS, a syscall allowlist. What it does **not**
+contain is a **kernel-level** escape (a Linux LPE through a syscall that is on
+the seccomp allowlist). For a single-user portfolio app that is an accepted risk.
+If Pillow Polygons ever takes untrusted public traffic at volume, the next step
+is a syscall-filtered / virtualized jail so a kernel bug is contained too:
+
+- **nsjail** with a tight seccomp-bpf policy (cheap, same host),
+- **gVisor** (`runsc`) — a user-space kernel intercepting syscalls, or
+- a **Firecracker** microVM per render — strongest, with a real VM boundary.
+
+Recorded here so the decision is explicit; not needed at single-user scale.
 
 ### CSAM detection is not real here
 

@@ -34,6 +34,31 @@ anti_abuse.init(app)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
+# ── token cost accounting ────────────────────────────────────────────────────
+# Per-model Anthropic list price in USD per 1M tokens, (input, output). Keyed by
+# model-id prefix so a minor version bump (sonnet-4-6 -> 4-7) keeps its pricing
+# without a code change. Unknown models fall back to the Sonnet tier. Update if
+# Anthropic changes pricing; see https://docs.anthropic.com/en/docs/about-claude/pricing
+PRICING = {
+    "claude-opus":   (15.0, 75.0),
+    "claude-sonnet": (3.0, 15.0),
+    "claude-haiku":  (1.0, 5.0),
+}
+_DEFAULT_PRICING = (3.0, 15.0)
+
+
+def compute_cost(model, tokens_in, tokens_out):
+    """USD cost for one generation, from the stored model + token counts. Never
+    raises (cost reporting must not break a response); unknown models price at the
+    Sonnet tier."""
+    rate_in, rate_out = _DEFAULT_PRICING
+    for prefix, rates in PRICING.items():
+        if model and str(model).startswith(prefix):
+            rate_in, rate_out = rates
+            break
+    cost = (tokens_in or 0) / 1_000_000 * rate_in + (tokens_out or 0) / 1_000_000 * rate_out
+    return round(cost, 6)
+
 # Where scene code actually executes:
 #   "local"  — in a subprocess sandbox inside this process (default; simple dev).
 #   "worker" — handed to the network-less render worker over the shared job queue,
@@ -78,6 +103,7 @@ def init_db():
             height      INTEGER,
             tokens_in   INTEGER DEFAULT 0,
             tokens_out  INTEGER DEFAULT 0,
+            model       TEXT,
             scene_code  TEXT,
             created_at  TEXT
         );
@@ -100,6 +126,11 @@ def init_db():
             PRIMARY KEY (image_id, tag_id)
         );
         """)
+        # Auto-migrate DBs created before the `model` column existed, so cost
+        # reporting works without a manual migration step.
+        cols = {r[1] for r in db.execute("PRAGMA table_info(images)").fetchall()}
+        if "model" not in cols:
+            db.execute("ALTER TABLE images ADD COLUMN model TEXT")
     print("DB initialised")
 
 init_db()
@@ -198,6 +229,9 @@ def row_to_dict(row):
     d["folders"] = [r["name"] for r in db.execute(
         "SELECT f.name FROM folders f JOIN image_folders if2 ON f.id=if2.folder_id WHERE if2.image_id=?", (img_id,)
     ).fetchall()]
+    # Derived, not stored: USD cost from the model + token counts (works for old
+    # rows too — a NULL model just prices at the default tier).
+    d["cost_usd"] = compute_cost(d.get("model"), d.get("tokens_in"), d.get("tokens_out"))
     return d
 
 # ── routes: pages ──────────────────────────────────────────────────────────
@@ -350,10 +384,10 @@ def generate():
     db = get_db()
     db.execute("""
         INSERT INTO images (id, filename, thumb, prompt, preset, seed, width, height,
-                            tokens_in, tokens_out, scene_code, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                            tokens_in, tokens_out, model, scene_code, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (img_id, filename, thumb_name, prompt, preset, seed, width, height,
-          tokens_in, tokens_out, scene_code, created_at))
+          tokens_in, tokens_out, model, scene_code, created_at))
     db.commit()
 
     row = db.execute("SELECT * FROM images WHERE id=?", (img_id,)).fetchone()

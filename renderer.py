@@ -33,6 +33,23 @@ _DENIED_NAMES = frozenset({
     "memoryview", "help", "exit", "quit", "copyright", "credits", "license",
 })
 
+# Attribute names that must never be accessed, even though they don't start with
+# an underscore. These are the CPython frame/generator/coroutine/traceback
+# introspection attributes — the second known escape class after dunders.
+# A *running* generator/coroutine exposes its execution frame without any dunder:
+#     g = (x for x in range(1)); g.gi_frame.f_back.f_globals['os']
+# walks out of the restricted exec frame into renderer.py's own globals (which
+# DO import os/sys), reaching real modules with no `__`/`import`/builtin in sight.
+# We block the whole family by prefix so a future attr we didn't enumerate is
+# still caught; none of the injected drawing objects use these prefixes.
+_DENIED_ATTR_PREFIXES = ("f_", "gi_", "cr_", "ag_", "tb_", "func_")
+
+# Method names that walk attributes from a format string at runtime, e.g.
+#     '{0.__class__.__bases__}'.format(draw)   /   '{0.gi_frame}'.format_map(...)
+# The dunders/introspection attrs live inside a *string literal*, so the AST scan
+# above never sees them — deny the entry points instead.
+_DENIED_ATTRS = frozenset({"format", "format_map"})
+
 # The only builtins scene code is allowed to use. No __import__/open/eval/exec.
 _SAFE_BUILTIN_NAMES = (
     "abs", "all", "any", "bool", "bytearray", "bytes", "chr", "complex", "dict",
@@ -72,9 +89,18 @@ def validate_scene(code):
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             return "imports are not allowed in scene code"
-        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
-            # blocks __class__, __globals__, __subclasses__, __builtins__, etc.
-            return f"access to attribute '{node.attr}' is not allowed"
+        if isinstance(node, ast.Attribute):
+            attr = node.attr
+            if attr.startswith("_"):
+                # blocks __class__, __globals__, __subclasses__, __builtins__, etc.
+                return f"access to attribute '{attr}' is not allowed"
+            if attr.startswith(_DENIED_ATTR_PREFIXES):
+                # frame/generator/coroutine/traceback introspection (gi_frame,
+                # f_back, f_globals, cr_frame, tb_frame, …) — the non-dunder escape.
+                return f"access to introspection attribute '{attr}' is not allowed"
+            if attr in _DENIED_ATTRS:
+                # str.format / format_map walk attributes from the template string.
+                return f"access to attribute '{attr}' is not allowed"
         if isinstance(node, ast.Name):
             if node.id in _DENIED_NAMES:
                 return f"use of '{node.id}' is not allowed"

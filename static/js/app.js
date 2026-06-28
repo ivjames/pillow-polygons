@@ -19,6 +19,7 @@ const tokenMeter   = $("token-meter");
 const tIn          = $("t-in");
 const tOut         = $("t-out");
 const tTotal       = $("t-total");
+const tCost        = $("t-cost");
 const errorBox     = $("error-box");
 const resultImg    = $("result-img");
 const emptyState   = $("empty-state");
@@ -136,7 +137,7 @@ async function generate() {
     if (!res.ok) throw new Error(data.error || "Generation failed");
 
     showImage(data);
-    setTokens(data.tokens_in, data.tokens_out);
+    setTokens(data.tokens_in, data.tokens_out, data.cost_usd);
     await loadGallery();
     await loadFolders();
     selectThumb(data.id);
@@ -194,11 +195,19 @@ async function populateFolderSelect(current) {
 }
 
 /* ── Tokens ── */
-function setTokens(inp, out) {
+function setTokens(inp, out, cost) {
   tIn.textContent    = inp.toLocaleString();
   tOut.textContent   = out.toLocaleString();
   tTotal.textContent = (inp + out).toLocaleString();
+  tCost.textContent  = (cost == null) ? "—" : formatCost(cost);
   tokenMeter.classList.remove("hidden");
+}
+
+// Sub-cent renders are common; show enough precision to be meaningful.
+function formatCost(usd) {
+  if (usd >= 1)    return "$" + usd.toFixed(2);
+  if (usd >= 0.01) return "$" + usd.toFixed(3);
+  return "$" + usd.toFixed(5);
 }
 
 /* ── Tags ── */
@@ -299,7 +308,7 @@ function loadImageById(id) {
   const img = imageCache[id];
   if (!img) return;
   showImage(img);
-  setTokens(img.tokens_in || 0, img.tokens_out || 0);
+  setTokens(img.tokens_in || 0, img.tokens_out || 0, img.cost_usd);
   selectThumb(img.id);
 }
 

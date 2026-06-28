@@ -298,6 +298,7 @@ textarea { resize: vertical; min-height: 85px; }
 .token-val.in-val   { color: var(--blue); }
 .token-val.out-val  { color: var(--lime); }
 .token-val.tot-val  { color: var(--yellow); }
+.token-val.cost-val { color: var(--pink, #ff3b7a); }
 
 /* ── Error ── */
 .error-box {
