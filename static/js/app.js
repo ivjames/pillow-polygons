@@ -107,6 +107,10 @@ prompt.addEventListener("keydown", e => {
 async function generate() {
   const p = prompt.value.trim();
   if (!p) { showError("Enter a prompt."); return; }
+  if (!$("ack-checkbox").checked) {
+    showError("Please accept the content policy before generating.");
+    return;
+  }
 
   setLoading(true);
   hideError();
@@ -118,6 +122,9 @@ async function generate() {
   fd.append("seed",   seedInput.value);
   fd.append("width",  widthInput.value);
   fd.append("height", heightInput.value);
+  fd.append("ack",        $("ack-checkbox").checked ? "1" : "");
+  fd.append("form_token", $("form-token").value);
+  fd.append("website",    $("website").value);   // honeypot (stays empty for humans)
   if (refFile) fd.append("ref", refFile);
 
   try {

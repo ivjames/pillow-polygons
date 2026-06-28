@@ -81,6 +81,25 @@
           </div>
         </div>
 
+        <!-- Honeypot: hidden from humans, bots tend to fill it. Do not remove. -->
+        <div class="hp-field" aria-hidden="true">
+          <label>Website</label>
+          <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
+        </div>
+
+        <!-- Signed, timestamped anti-bot form token issued at page load. -->
+        <input type="hidden" id="form-token" value="{{ form_token }}">
+
+        <!-- Content policy notice + required acknowledgement. -->
+        <div class="policy-notice">
+          <p>Don't upload or attempt to generate NSFW or illegal content.
+             Uploads and prompts may be screened.</p>
+          <label class="ack-row">
+            <input type="checkbox" id="ack-checkbox">
+            <span>I understand and accept the content policy.</span>
+          </label>
+        </div>
+
         <button class="generate-btn" id="generate-btn">
           <span id="btn-label">Generate</span>
           <svg class="spinner hidden" id="spinner" width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
