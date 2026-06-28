@@ -6,10 +6,14 @@ import anthropic
 import anti_abuse
 
 # ── paths ──────────────────────────────────────────────────────────────────
+# RENDERS_DIR/UPLOADS_DIR stay under static/ (Flask serves them at /static/...);
+# in a hardened container, mount writable volumes at those paths. The DB isn't
+# served, so POLY_DB_PATH is env-overridable to a writable volume — this is what
+# lets the app run on a read-only root filesystem. Defaults preserve the local layout.
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 RENDERS_DIR = os.path.join(BASE_DIR, "static", "renders")
 UPLOADS_DIR = os.path.join(BASE_DIR, "static", "uploads")
-DB_PATH     = os.path.join(BASE_DIR, "poly.db")
+DB_PATH     = os.environ.get("POLY_DB_PATH") or os.path.join(BASE_DIR, "poly.db")
 RENDERER    = os.path.join(BASE_DIR, "renderer.py")
 
 os.makedirs(RENDERS_DIR, exist_ok=True)
