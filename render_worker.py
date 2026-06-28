@@ -20,7 +20,8 @@ import glob
 import time
 
 import sandbox
-from jobqueue import incoming, done, ensure_dirs, _atomic_write, _quiet_remove
+import jobqueue
+from jobqueue import incoming, done, ensure_dirs, _atomic_write, _quiet_remove, started_marker
 from renderer import SceneValidationError
 
 # Default output dir matches the web image's RENDERS_DIR; both containers mount
@@ -80,10 +81,14 @@ def _process(spec_path):
         _quiet_remove(claim_path)
         return
 
+    # Tell the web side the render is now starting, so its render-budget clock
+    # begins here rather than at enqueue (queue wait doesn't count against it).
+    jobqueue.touch(started_marker(job_id))
+
     envelope = _result_for(spec)
     _atomic_write(os.path.join(done(), f"{job_id}.json"), json.dumps(envelope))
 
-    # Clean up the claimed spec + any ref; the web side removes the done file.
+    # Clean up the claimed spec + any ref; the web side removes the done/started files.
     _quiet_remove(claim_path)
     if spec.get("ref"):
         _quiet_remove(os.path.join(incoming(), spec["ref"]))
@@ -91,13 +96,19 @@ def _process(spec_path):
 
 def main():
     ensure_dirs()
+    hb_path = jobqueue.heartbeat_path()
+    last_hb = 0.0
     print(f"render_worker: watching {incoming()} -> {done()}", flush=True)
     while True:
         specs = sorted(glob.glob(os.path.join(incoming(), "*.json")))
         if not specs:
+            now = time.time()
+            if now - last_hb > 2:        # liveness signal while idle
+                jobqueue.touch(hb_path); last_hb = now
             time.sleep(IDLE_SLEEP)
             continue
         for spec_path in specs:
+            jobqueue.touch(hb_path); last_hb = time.time()   # progress before each job
             _process(spec_path)
 
 

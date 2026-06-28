@@ -32,13 +32,38 @@ def jobs_dir():  return os.environ.get("JOBS_DIR", "/jobs")
 def incoming():  return os.path.join(jobs_dir(), "incoming")
 def done():      return os.path.join(jobs_dir(), "done")
 
+# The worker writes a per-job "started" marker when it begins rendering, and
+# refreshes a global heartbeat as it works. The web tier uses these so a job that
+# is merely *queued* behind others isn't timed out against one render's budget.
+def started_marker(job_id):  return os.path.join(done(), f"{job_id}.started")
+def heartbeat_path():        return os.path.join(jobs_dir(), ".heartbeat")
+
 POLL_INTERVAL = 0.05
 
-# How long the web tier waits for a result. The worker enforces its own
-# per-render wall-clock limit (RENDER_WALL_SECONDS); we wait a bit longer so the
-# worker's own timeout/error reaches us as a result rather than racing it.
-def _result_timeout():
+# Budget for a single render once the worker has actually started it. The worker
+# enforces its own wall-clock limit (RENDER_WALL_SECONDS); we wait a bit longer
+# so its own timeout/error reaches us as a result rather than racing it.
+def _render_budget():
     return int(os.environ.get("RENDER_WALL_SECONDS", 20)) + 15
+
+# While a job is still queued, we keep waiting as long as the worker shows signs
+# of life. It can't refresh the heartbeat while blocked in another job's render,
+# so the liveness window must exceed one render's wall time.
+def _worker_liveness():
+    return int(os.environ.get("RENDER_WALL_SECONDS", 20)) + 20
+
+# Absolute backstop so a wedged queue can't hang a request forever.
+def _max_total_wait():
+    return int(os.environ.get("RENDER_QUEUE_MAX_WAIT", 300))
+
+
+def touch(path):
+    """Write the current time to a marker file (no fsync — cheap progress signal)."""
+    try:
+        with open(path, "w") as f:
+            f.write(str(time.time()))
+    except OSError:
+        pass
 
 
 def ensure_dirs():
@@ -89,21 +114,54 @@ def submit_and_wait(scene_code, *, filename, width, height, seed,
     spec_path = os.path.join(incoming(), f"{job_id}.json")
     _atomic_write(spec_path, json.dumps(spec))
 
-    done_path = os.path.join(done(), f"{job_id}.json")
-    deadline = time.time() + _result_timeout()
+    done_path     = os.path.join(done(), f"{job_id}.json")
+    started_path  = started_marker(job_id)
+    hb_path       = heartbeat_path()
+    submit_time   = time.time()
+    hard_deadline = submit_time + _max_total_wait()
+    render_deadline = None        # set once the worker starts THIS job
     try:
-        while time.time() < deadline:
+        while True:
             if os.path.exists(done_path):
                 with open(done_path) as f:
                     res = json.load(f)
                 return _interpret(res)
+
+            now = time.time()
+
+            # Once the worker marks this job started, the render clock begins —
+            # queue wait before that point doesn't count against the render budget.
+            if render_deadline is None and os.path.exists(started_path):
+                try:
+                    render_deadline = os.path.getmtime(started_path) + _render_budget()
+                except OSError:
+                    render_deadline = now + _render_budget()
+
+            if render_deadline is not None:
+                if now > render_deadline:
+                    raise sandbox.RenderTimeout(
+                        f"render exceeded {_render_budget()}s after it started")
+            else:
+                # Still queued. Keep waiting only while the worker is alive —
+                # the heartbeat must have advanced within the liveness window.
+                try:
+                    last_progress = os.path.getmtime(hb_path)
+                except OSError:
+                    last_progress = submit_time   # worker hasn't beat yet
+                if now - last_progress > _worker_liveness():
+                    raise sandbox.RenderError(
+                        "render worker is not responding (stale heartbeat)")
+
+            if now > hard_deadline:
+                raise sandbox.RenderTimeout(
+                    f"render did not complete within {_max_total_wait()}s")
+
             time.sleep(POLL_INTERVAL)
-        raise sandbox.RenderTimeout(
-            f"render worker did not respond within {_result_timeout()}s")
     finally:
         # Best-effort cleanup; the worker removes the incoming files when it
         # claims a job, but if it never ran we clean up our own.
         _quiet_remove(done_path)
+        _quiet_remove(started_path)
         _quiet_remove(spec_path)
         if ref_name:
             _quiet_remove(os.path.join(incoming(), ref_name))
