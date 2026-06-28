@@ -49,6 +49,8 @@ All optional — defaults preserve current behavior for a single user.
 | `RENDER_WALL_SECONDS` | `20` | Wall-clock timeout; a render exceeding it is killed. |
 | `RENDER_FSIZE_MB` | `64` | Max output file size the render subprocess may write. |
 | `RENDER_CONCURRENCY` | `1` | Max simultaneous render subprocesses. Keeps worst-case render memory at one `RENDER_MEM_MB` (vs. `threads × RENDER_MEM_MB`); size the container memory accordingly. |
+| `RENDER_MODE` | `local` | `worker` routes scene execution to the network-less render worker (see `DEPLOY.md`); `local` runs the in-process subprocess sandbox. |
+| `JOBS_DIR` | `/jobs` | Shared job-queue directory used when `RENDER_MODE=worker`. |
 
 ### Optional upgrades (not hard-required)
 
@@ -88,11 +90,16 @@ scene (infinite loop, memory bomb, segfault, OOM-kill) is contained and killed
 without taking down the Flask process. All limits are env-tunable
 (`RENDER_CPU_SECONDS`, `RENDER_MEM_MB`, `RENDER_WALL_SECONDS`, `RENDER_FSIZE_MB`).
 
-**Residual risk / further hardening.** Layer A denies network/filesystem access
-at the language level, but kernel-level isolation (a seccomp syscall filter, a
-network namespace, a read-only root FS) needs root or a container and is a
-deployment concern. For production, also run the render child inside a
-locked-down container/netns. This is noted as a `TODO` in `sandbox.py`.
+**C. Network-less worker (deployment, `RENDER_MODE=worker`)**
+In the container deployment, scene code executes **only** in a dedicated
+`render` service running with `network_mode: none`, a deny-by-default seccomp
+profile, a read-only rootfs, and dropped capabilities. The web tier (which needs
+the network for HTTP + the Anthropic API) never `exec()`s scene code — it hands
+jobs to the worker over a shared filesystem queue (`jobqueue.py` /
+`render_worker.py`). So even a kernel-level escape from layers A/B has no network
+and no access to the web tier or its API key. Set `RENDER_MODE=local` (the
+default) to run the in-process sandbox instead — used for development and tests.
+See `DEPLOY.md`.
 
 ### CSAM detection is not real here
 

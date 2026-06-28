@@ -23,6 +23,7 @@ os.makedirs(UPLOADS_DIR, exist_ok=True)
 sys.path.insert(0, BASE_DIR)
 from renderer import render as poly_render, validate_scene as renderer_validate, SceneValidationError
 import sandbox
+import jobqueue
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB upload limit
@@ -32,6 +33,24 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB upload limit
 anti_abuse.init(app)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Where scene code actually executes:
+#   "local"  — in a subprocess sandbox inside this process (default; simple dev).
+#   "worker" — handed to the network-less render worker over the shared job queue,
+#              so this web tier never exec()s scene code (issue #2). See render_worker.py.
+RENDER_MODE = os.environ.get("RENDER_MODE", "local").strip().lower()
+
+
+def _render_scene(scene_code, *, filename, width, height, seed, ref, preset):
+    """Dispatch a render to the worker queue or the in-process sandbox. Both
+    return renderer.render()'s dict and raise the same exceptions."""
+    if RENDER_MODE == "worker":
+        return jobqueue.submit_and_wait(
+            scene_code, filename=filename, width=width, height=height, seed=seed,
+            ref=ref, preset=preset, thumbnail=True, output_dir=RENDERS_DIR)
+    return sandbox.run_scene(
+        scene_code, filename=filename, width=width, height=height, seed=seed,
+        ref=ref, preset=preset, thumbnail=True, _output_dir=RENDERS_DIR)
 
 # ── DB ─────────────────────────────────────────────────────────────────────
 def get_db():
@@ -305,16 +324,15 @@ def generate():
         if safety_err2:
             return jsonify({"error": f"Scene rejected by sandbox: {safety_err2}", "scene_code": scene_code}), 400
 
-    # render — executed in a resource-limited subprocess sandbox (sandbox.py)
+    # render — in-process sandbox (local) or the network-less worker (worker mode)
     img_id   = uuid.uuid4().hex
     filename = f"{img_id}.png"
 
     try:
-        result = sandbox.run_scene(
+        result = _render_scene(
             scene_code, filename=filename,
             width=width, height=height, seed=seed,
-            ref=ref_pil, preset=preset, thumbnail=True,
-            _output_dir=RENDERS_DIR
+            ref=ref_pil, preset=preset
         )
     except SceneValidationError as e:
         return jsonify({"error": f"Scene rejected by sandbox: {e}", "scene_code": scene_code}), 400
