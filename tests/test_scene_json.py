@@ -140,6 +140,31 @@ def test_scatter_count_is_bounded_per_op():
         assert os.path.exists(res["png"])
 
 
+def test_scatter_charged_for_stamped_shape_weight():
+    # A modest count stamping a heavy (many-point) shape must be rejected — the
+    # draw budget charges count × the shape's point weight, not just count.
+    heavy = {"layers": [{"ops": [{"op": "scatter", "count": 500,
+             "shape": {"op": "polygon", "points": [[0, 0]] * 1000}}]}]}  # 500k >> MAX_DRAWS
+    assert scene_json.validate_scene_json(heavy) is not None
+    light = {"layers": [{"ops": [{"op": "scatter", "count": 300,
+             "shape": {"op": "ellipse", "bbox": [-1, -1, 1, 1], "fill": [255, 255, 255]}}]}]}
+    assert scene_json.validate_scene_json(light) is None
+
+
+def test_translucent_layer_fades_the_svg_too():
+    # A layer with alpha < 255 fades the PNG; the SVG twin must match via a
+    # <g opacity>, and a fully-opaque layer must NOT be wrapped.
+    scene = {"layers": [
+        {"alpha": 120, "ops": [{"op": "ellipse", "bbox": [10, 10, 90, 90], "fill": [200, 180, 90]}]},
+        {"ops": [{"op": "rectangle", "bbox": [20, 20, 60, 60], "fill": [10, 10, 10]}]},
+    ]}
+    with tempfile.TemporaryDirectory() as d:
+        res = renderer.render_json(scene, filename="t.png", width=128, height=128, _output_dir=d)
+        svg = open(res["svg"]).read()
+        assert svg.count("<g opacity") == 1, "exactly the translucent layer should be grouped"
+        assert '<g opacity="0.471">' in svg, "120/255 ≈ 0.471 opacity group expected"
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

@@ -190,6 +190,19 @@ class SVGRecorder:
         s = f'stroke="{self._col(stroke)}" stroke-width="{width}"' if stroke else 'stroke="none"'
         self._elems.append(f'<path d="{d}" fill="{self._col(fill)}" {s}/>')
 
+    def mark(self):
+        """Index of the next element — pair with group_opacity() to wrap a range."""
+        return len(self._elems)
+
+    def group_opacity(self, start, opacity):
+        """Wrap the elements recorded since `start` in a <g opacity="..."> so a
+        translucent JSON layer renders the same in the SVG twin as in the PNG
+        (otherwise those elements were recorded at full opacity)."""
+        if opacity >= 1 or start >= len(self._elems):
+            return
+        inner = "".join(self._elems[start:])
+        self._elems[start:] = [f'<g opacity="{max(0.0, opacity):.3f}">{inner}</g>']
+
     def linear_gradient_bg(self, c0, c1, horizontal=False):
         """Register a linear-gradient def and fill the whole canvas with it — one
         vector element regardless of canvas size (resolution-independent, ~0 cost)."""

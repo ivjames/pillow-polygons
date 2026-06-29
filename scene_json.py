@@ -160,17 +160,34 @@ def _validate_op(op, where, nested):
     return None
 
 
+def _shape_weight(op):
+    """Rough per-stamp draw weight of a leaf shape — points dominate cost (each
+    stamped copy replays all of them, in both the PNG and the SVG). So scatter/
+    repeat must be charged count × this, not just count, or a compact scene could
+    stamp thousands of 2000-point polygons and blow past MAX_DRAWS at render time."""
+    if not isinstance(op, dict):
+        return 1
+    name = op.get("op")
+    if name == "bezier":
+        return MAX_BEZIER_SAMPLES
+    if name in ("polygon", "line", "point"):
+        pts = op.get("points")
+        return max(1, len(pts)) if isinstance(pts, list) else 1
+    return 1
+
+
 def _op_draw_cost(op):
     """Expanded primitive count an op contributes to the MAX_DRAWS budget."""
     name = op.get("op")
     if name == "grain":
         return min(MAX_GRAIN, max(0, int(_num(op.get("count", 0)))))
     if name == "scatter":
-        return min(MAX_SCATTER, max(0, int(_num(op.get("count", 0)))))
+        count = min(MAX_SCATTER, max(0, int(_num(op.get("count", 0)))))
+        return count * _shape_weight(op.get("shape"))
     if name == "repeat":
         nx = max(0, int(_num(op.get("nx", 0))))
         ny = max(0, int(_num(op.get("ny", 0))))
-        return min(MAX_SCATTER, nx * ny)
+        return min(MAX_SCATTER, nx * ny) * _shape_weight(op.get("shape"))
     return 1
 
 
@@ -504,6 +521,7 @@ def paint(scene, *, img, draw, svg, W, H, rng, palette):
         ops = layer.get("ops", []) or []
         overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         odraw = ImageDraw.Draw(overlay)
+        svg_start = svg.mark() if svg is not None else 0
         for op in ops:
             try:
                 _draw_op(op, odraw, svg, palette, W, H, rng)
@@ -513,6 +531,9 @@ def paint(scene, *, img, draw, svg, W, H, rng, palette):
         if a < 255:
             scaled = overlay.split()[3].point(lambda v: v * a // 255)
             overlay.putalpha(scaled)
+            if svg is not None:
+                # Mirror the layer fade in the SVG twin so it matches the PNG.
+                svg.group_opacity(svg_start, a / 255)
         img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
 
     return img

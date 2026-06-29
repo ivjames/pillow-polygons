@@ -115,6 +115,7 @@ def init_db():
             tokens_out  INTEGER DEFAULT 0,
             model       TEXT,
             scene_code  TEXT,
+            svg         TEXT,
             created_at  TEXT
         );
         CREATE TABLE IF NOT EXISTS folders (
@@ -136,11 +137,13 @@ def init_db():
             PRIMARY KEY (image_id, tag_id)
         );
         """)
-        # Auto-migrate DBs created before the `model` column existed, so cost
-        # reporting works without a manual migration step.
+        # Auto-migrate older DBs so cost reporting (`model`) and the persistent
+        # SVG link (`svg`) work without a manual migration step.
         cols = {r[1] for r in db.execute("PRAGMA table_info(images)").fetchall()}
         if "model" not in cols:
             db.execute("ALTER TABLE images ADD COLUMN model TEXT")
+        if "svg" not in cols:
+            db.execute("ALTER TABLE images ADD COLUMN svg TEXT")
     print("DB initialised")
 
 init_db()
@@ -412,6 +415,9 @@ def row_to_dict(row):
     # Derived, not stored: USD cost from the model + token counts (works for old
     # rows too — a NULL model just prices at the default tier).
     d["cost_usd"] = compute_cost(d.get("model"), d.get("tokens_in"), d.get("tokens_out"))
+    # SVG link from the stored basename, so the download button survives reloads
+    # and gallery selection (not just the immediate generate response).
+    d["svg_url"] = f"/static/renders/{d['svg']}" if d.get("svg") else None
     return d
 
 # ── routes: pages ──────────────────────────────────────────────────────────
@@ -501,17 +507,17 @@ def generate():
     db = get_db()
     db.execute("""
         INSERT INTO images (id, filename, thumb, prompt, preset, seed, width, height,
-                            tokens_in, tokens_out, model, scene_code, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            tokens_in, tokens_out, model, scene_code, svg, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (img_id, filename, thumb_name, prompt, preset, seed, width, height,
-          tokens_in, tokens_out, model, scene_text, created_at))
+          tokens_in, tokens_out, model, scene_text, svg_name, created_at))
     db.commit()
 
     row = db.execute("SELECT * FROM images WHERE id=?", (img_id,)).fetchone()
+    # svg_url comes from row_to_dict (stored column); url/thumb_url are per-request.
     return jsonify({**row_to_dict(row),
                     "url":       f"/static/renders/{filename}",
-                    "thumb_url": f"/static/renders/{thumb_name}" if thumb_name else None,
-                    "svg_url":   f"/static/renders/{svg_name}"   if svg_name   else None})
+                    "thumb_url": f"/static/renders/{thumb_name}" if thumb_name else None})
 
 # ── routes: images ─────────────────────────────────────────────────────────
 @app.route("/api/images")
