@@ -99,6 +99,7 @@ are documented in the README; the deployment-relevant additions are:
 | `RENDER_CPU_SECONDS` / `RENDER_MEM_MB` / `RENDER_WALL_SECONDS` / `RENDER_FSIZE_MB` | `10` / `1024` / `20` / `64` | Per-render subprocess limits. |
 | `RENDER_CONCURRENCY` | `1` | Max simultaneous render subprocesses in the worker (see memory budget below). |
 | `RENDER_MODE` | `local` | `worker` routes renders to the network-less worker (compose sets this on `web`); `local` runs the in-process sandbox. |
+| `SCENE_FORMAT` | `python` | `json` makes the model emit a declarative JSON scene drawn by a fixed interpreter (no code execution; see the README "Scene format" section). `python` is the default exec'd-scene-code path. |
 | `JOBS_DIR` | `/jobs` | Shared job-queue directory (mounted into both `web` and `render`). |
 | `RENDER_QUEUE_MAX_WAIT` | `300` | Absolute backstop (seconds) the web tier waits for a queued render before giving up. A job only counts against the per-render budget once the worker *starts* it; queue wait is bounded by this instead. |
 

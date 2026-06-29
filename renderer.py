@@ -33,6 +33,23 @@ _DENIED_NAMES = frozenset({
     "memoryview", "help", "exit", "quit", "copyright", "credits", "license",
 })
 
+# Attribute names that must never be accessed, even though they don't start with
+# an underscore. These are the CPython frame/generator/coroutine/traceback
+# introspection attributes — the second known escape class after dunders.
+# A *running* generator/coroutine exposes its execution frame without any dunder:
+#     g = (x for x in range(1)); g.gi_frame.f_back.f_globals['os']
+# walks out of the restricted exec frame into renderer.py's own globals (which
+# DO import os/sys), reaching real modules with no `__`/`import`/builtin in sight.
+# We block the whole family by prefix so a future attr we didn't enumerate is
+# still caught; none of the injected drawing objects use these prefixes.
+_DENIED_ATTR_PREFIXES = ("f_", "gi_", "cr_", "ag_", "tb_", "func_")
+
+# Method names that walk attributes from a format string at runtime, e.g.
+#     '{0.__class__.__bases__}'.format(draw)   /   '{0.gi_frame}'.format_map(...)
+# The dunders/introspection attrs live inside a *string literal*, so the AST scan
+# above never sees them — deny the entry points instead.
+_DENIED_ATTRS = frozenset({"format", "format_map"})
+
 # The only builtins scene code is allowed to use. No __import__/open/eval/exec.
 _SAFE_BUILTIN_NAMES = (
     "abs", "all", "any", "bool", "bytearray", "bytes", "chr", "complex", "dict",
@@ -72,9 +89,18 @@ def validate_scene(code):
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             return "imports are not allowed in scene code"
-        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
-            # blocks __class__, __globals__, __subclasses__, __builtins__, etc.
-            return f"access to attribute '{node.attr}' is not allowed"
+        if isinstance(node, ast.Attribute):
+            attr = node.attr
+            if attr.startswith("_"):
+                # blocks __class__, __globals__, __subclasses__, __builtins__, etc.
+                return f"access to attribute '{attr}' is not allowed"
+            if attr.startswith(_DENIED_ATTR_PREFIXES):
+                # frame/generator/coroutine/traceback introspection (gi_frame,
+                # f_back, f_globals, cr_frame, tb_frame, …) — the non-dunder escape.
+                return f"access to introspection attribute '{attr}' is not allowed"
+            if attr in _DENIED_ATTRS:
+                # str.format / format_map walk attributes from the template string.
+                return f"access to attribute '{attr}' is not allowed"
         if isinstance(node, ast.Name):
             if node.id in _DENIED_NAMES:
                 return f"use of '{node.id}' is not allowed"
@@ -159,12 +185,51 @@ class SVGRecorder:
             f'font-family="sans-serif">{text}</text>'
         )
 
+    def path(self, d, fill=None, stroke=None, width=1):
+        """A raw SVG path (used for bezier curves). `d` is a pre-built path string."""
+        s = f'stroke="{self._col(stroke)}" stroke-width="{width}"' if stroke else 'stroke="none"'
+        self._elems.append(f'<path d="{d}" fill="{self._col(fill)}" {s}/>')
+
+    def mark(self):
+        """Index of the next element — pair with group_opacity() to wrap a range."""
+        return len(self._elems)
+
+    def group_opacity(self, start, opacity):
+        """Wrap the elements recorded since `start` in a <g opacity="..."> so a
+        translucent JSON layer renders the same in the SVG twin as in the PNG
+        (otherwise those elements were recorded at full opacity)."""
+        if opacity >= 1 or start >= len(self._elems):
+            return
+        inner = "".join(self._elems[start:])
+        self._elems[start:] = [f'<g opacity="{max(0.0, opacity):.3f}">{inner}</g>']
+
+    def linear_gradient_bg(self, c0, c1, horizontal=False):
+        """Register a linear-gradient def and fill the whole canvas with it — one
+        vector element regardless of canvas size (resolution-independent, ~0 cost)."""
+        gid = f"g{len(self._defs)}"
+        x2, y2 = (1, 0) if horizontal else (0, 1)
+        self._defs.append(
+            f'<linearGradient id="{gid}" x1="0" y1="0" x2="{x2}" y2="{y2}">'
+            f'<stop offset="0" stop-color="{self._col(c0)}"/>'
+            f'<stop offset="1" stop-color="{self._col(c1)}"/></linearGradient>')
+        self._elems.append(f'<rect width="{self.W}" height="{self.H}" fill="url(#{gid})"/>')
+
+    def radial_gradient_bg(self, inner, outer, cx, cy, r):
+        gid = f"g{len(self._defs)}"
+        self._defs.append(
+            f'<radialGradient id="{gid}" cx="{cx/self.W:.3f}" cy="{cy/self.H:.3f}" '
+            f'r="{r/max(self.W,self.H):.3f}">'
+            f'<stop offset="0" stop-color="{self._col(inner)}"/>'
+            f'<stop offset="1" stop-color="{self._col(outer)}"/></radialGradient>')
+        self._elems.append(f'<rect width="{self.W}" height="{self.H}" fill="url(#{gid})"/>')
+
     def to_svg(self, bg_color=(255,255,255)):
         bg = self._col(bg_color)
         body = "\n  ".join(self._elems)
+        defs = ("\n  <defs>" + "".join(self._defs) + "</defs>") if self._defs else ""
         return (f'<?xml version="1.0" encoding="UTF-8"?>\n'
                 f'<svg xmlns="http://www.w3.org/2000/svg" '
-                f'width="{self.W}" height="{self.H}" viewBox="0 0 {self.W} {self.H}">\n'
+                f'width="{self.W}" height="{self.H}" viewBox="0 0 {self.W} {self.H}">{defs}\n'
                 f'  <rect width="{self.W}" height="{self.H}" fill="{bg}"/>\n'
                 f'  {body}\n</svg>')
 
@@ -246,9 +311,58 @@ def render(
         ctx["img"]  = img
         ctx["draw"] = ImageDraw.Draw(img)
 
-    out_dir = _output_dir or OUTPUT_DIR
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, filename)
+    meta = {
+        "filename":    filename,
+        "width":       W,
+        "height":      H,
+        "seed":        seed,
+        "preset":      preset,
+        "format":      "python",
+        "layers":      len(codes),
+        "rendered_at": datetime.utcnow().isoformat() + "Z",
+        "scene_code":  codes,
+    }
+    return _write_outputs(img, svg_rec, filename=filename, out_dir=_output_dir,
+                          meta=meta, preset=preset, thumbnail=thumbnail)
+
+
+def render_json(
+    scene,
+    filename:    str   = "output.png",
+    width:       int   = 1024,
+    height:      int   = 1024,
+    seed:        int   = 42,
+    preset:      str   = None,
+    thumbnail:   bool  = True,
+    _output_dir: str   = None,
+) -> dict:
+    """Render a *declarative JSON* scene — the safe-by-construction alternative to
+    render(): the scene is data, interpreted by scene_json.paint() with a fixed
+    set of Pillow primitives. No exec, so no RCE surface. Same return shape as
+    render(). `scene` is a dict or a JSON string.
+
+    Schema invalid -> SceneValidationError (the same type render() raises for a
+    rejected scene, so the sandbox/app error paths treat both identically)."""
+    import scene_json
+
+    if isinstance(scene, str):
+        try:
+            scene = json.loads(scene)
+        except (ValueError, TypeError) as e:
+            raise SceneValidationError(f"scene is not valid JSON: {e}")
+    err = scene_json.validate_scene_json(scene)
+    if err:
+        raise SceneValidationError(err)
+
+    W, H = width, height
+    img, _ = _make_canvas(W, H, preset)
+    svg_rec = SVGRecorder(W, H)
+    rng     = random.Random(seed)
+    _base_palette = {"bg": (20,20,30), "atmosphere": (30,30,50,40), "accent": (200,200,255), "grain": 2000}
+    palette = {**_base_palette, **(PRESETS.get(preset, {}) if preset else {})}
+
+    img = scene_json.paint(scene, img=img, draw=ImageDraw.Draw(img), svg=svg_rec,
+                           W=W, H=H, rng=rng, palette=palette)
 
     meta = {
         "filename":    filename,
@@ -256,13 +370,24 @@ def render(
         "height":      H,
         "seed":        seed,
         "preset":      preset,
-        "layers":      len(codes),
+        "format":      "json",
+        "layers":      len(scene.get("layers", [])),
         "rendered_at": datetime.utcnow().isoformat() + "Z",
-        "scene_code":  codes,
+        "scene":       scene,
     }
+    return _write_outputs(img, svg_rec, filename=filename, out_dir=_output_dir,
+                          meta=meta, preset=preset, thumbnail=thumbnail)
+
+
+def _write_outputs(img, svg_rec, *, filename, out_dir, meta, preset, thumbnail):
+    """Shared output stage for both render paths: PNG + JSON sidecar, an optional
+    SVG twin (when the scene emitted vector primitives), and a thumbnail."""
+    out_dir  = out_dir or OUTPUT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, filename)
+
     _save_with_sidecar(img, out_path, meta)
 
-    # SVG output
     svg_path = None
     if svg_rec._elems:
         bg = PRESETS[preset]["bg"] if preset and preset in PRESETS else (255,255,255)
@@ -272,7 +397,6 @@ def render(
         with open(svg_path, "w") as f:
             f.write(svg_str)
 
-    # Thumbnail
     thumb_path = None
     if thumbnail:
         thumb = img.copy()

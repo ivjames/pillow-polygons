@@ -71,19 +71,6 @@
           </div>
         </div>
 
-        <div class="field">
-          <label>Reference image <span class="muted">optional — sampled for color</span></label>
-          <div class="upload-zone" id="upload-zone">
-            <input type="file" id="ref-input" accept="image/*" hidden>
-            <div class="upload-inner" id="upload-inner">
-              <span class="upload-icon">⊕</span>
-              <span>Drop or click to upload</span>
-            </div>
-            <img id="ref-preview" class="ref-preview hidden" alt="Reference">
-            <button class="remove-ref hidden" id="remove-ref">✕</button>
-          </div>
-        </div>
-
         <!-- Honeypot: hidden from humans, bots tend to fill it. Do not remove. -->
         <div class="hp-field" aria-hidden="true">
           <label>Website</label>
@@ -103,8 +90,8 @@
 
         <!-- Content policy notice + required acknowledgement. -->
         <div class="policy-notice">
-          <p>Don't upload or attempt to generate NSFW or illegal content.
-             Uploads and prompts may be screened.</p>
+          <p>Don't attempt to generate NSFW or illegal content.
+             Prompts may be screened.</p>
           <label class="ack-row">
             <input type="checkbox" id="ack-checkbox">
             <span>I understand and accept the content policy.</span>
@@ -131,6 +118,10 @@
           <div class="token-row">
             <span class="token-label">TOTAL</span>
             <span class="token-val tot-val" id="t-total">—</span>
+          </div>
+          <div class="token-row">
+            <span class="token-label">COST</span>
+            <span class="token-val cost-val" id="t-cost">—</span>
           </div>
         </div>
 

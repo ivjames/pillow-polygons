@@ -3,7 +3,6 @@ let activeImage  = null;   // current image object
 let activeFolder = "";
 let activeTag    = "";
 let searchQ      = "";
-let refFile      = null;
 let selectedPreset = "";
 
 /* ── DOM refs ── */
@@ -19,6 +18,7 @@ const tokenMeter   = $("token-meter");
 const tIn          = $("t-in");
 const tOut         = $("t-out");
 const tTotal       = $("t-total");
+const tCost        = $("t-cost");
 const errorBox     = $("error-box");
 const resultImg    = $("result-img");
 const emptyState   = $("empty-state");
@@ -33,11 +33,6 @@ const galleryGrid  = $("gallery-grid");
 const searchInput  = $("search-input");
 const folderBar    = $("folder-bar");
 const tagBar       = $("tag-bar");
-const uploadZone   = $("upload-zone");
-const uploadInner  = $("upload-inner");
-const refInput     = $("ref-input");
-const refPreview   = $("ref-preview");
-const removeRef    = $("remove-ref");
 const newFolderInput = $("new-folder-input");
 const createFolderBtn = $("create-folder-btn");
 
@@ -68,35 +63,6 @@ $("toggle-gallery").addEventListener("click", () => {
   $("toggle-gallery").textContent = g.classList.contains("collapsed") ? "‹" : "›";
 });
 
-/* ── Upload zone ── */
-uploadZone.addEventListener("click", () => !refFile && refInput.click());
-uploadZone.addEventListener("dragover", e => { e.preventDefault(); uploadZone.classList.add("drag"); });
-uploadZone.addEventListener("dragleave", () => uploadZone.classList.remove("drag"));
-uploadZone.addEventListener("drop", e => {
-  e.preventDefault();
-  uploadZone.classList.remove("drag");
-  const f = e.dataTransfer.files[0];
-  if (f && f.type.startsWith("image/")) setRef(f);
-});
-refInput.addEventListener("change", () => refInput.files[0] && setRef(refInput.files[0]));
-removeRef.addEventListener("click", e => { e.stopPropagation(); clearRef(); });
-
-function setRef(file) {
-  refFile = file;
-  const url = URL.createObjectURL(file);
-  refPreview.src = url;
-  refPreview.classList.remove("hidden");
-  uploadInner.classList.add("hidden");
-  removeRef.classList.remove("hidden");
-}
-function clearRef() {
-  refFile = null;
-  refPreview.classList.add("hidden");
-  refPreview.src = "";
-  uploadInner.classList.remove("hidden");
-  removeRef.classList.add("hidden");
-  refInput.value = "";
-}
 
 /* ── Generate ── */
 generateBtn.addEventListener("click", generate);
@@ -128,7 +94,6 @@ async function generate() {
   // Turnstile token, only present when CAPTCHA_SITEKEY is configured server-side.
   const captcha = document.querySelector('[name="cf-turnstile-response"]');
   if (captcha) fd.append("captcha_token", captcha.value);
-  if (refFile) fd.append("ref", refFile);
 
   try {
     const res  = await fetch("/api/generate", { method: "POST", body: fd });
@@ -136,7 +101,7 @@ async function generate() {
     if (!res.ok) throw new Error(data.error || "Generation failed");
 
     showImage(data);
-    setTokens(data.tokens_in, data.tokens_out);
+    setTokens(data.tokens_in, data.tokens_out, data.cost_usd);
     await loadGallery();
     await loadFolders();
     selectThumb(data.id);
@@ -194,11 +159,19 @@ async function populateFolderSelect(current) {
 }
 
 /* ── Tokens ── */
-function setTokens(inp, out) {
+function setTokens(inp, out, cost) {
   tIn.textContent    = inp.toLocaleString();
   tOut.textContent   = out.toLocaleString();
   tTotal.textContent = (inp + out).toLocaleString();
+  tCost.textContent  = (cost == null) ? "—" : formatCost(cost);
   tokenMeter.classList.remove("hidden");
+}
+
+// Sub-cent renders are common; show enough precision to be meaningful.
+function formatCost(usd) {
+  if (usd >= 1)    return "$" + usd.toFixed(2);
+  if (usd >= 0.01) return "$" + usd.toFixed(3);
+  return "$" + usd.toFixed(5);
 }
 
 /* ── Tags ── */
@@ -299,7 +272,7 @@ function loadImageById(id) {
   const img = imageCache[id];
   if (!img) return;
   showImage(img);
-  setTokens(img.tokens_in || 0, img.tokens_out || 0);
+  setTokens(img.tokens_in || 0, img.tokens_out || 0, img.cost_usd);
   selectThumb(img.id);
 }
 

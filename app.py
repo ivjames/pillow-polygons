@@ -1,38 +1,63 @@
-import os, json, sqlite3, uuid, base64, sys
+import os, json, sqlite3, uuid, sys
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory, render_template, g, after_this_request
-from PIL import Image as PILImage
+from flask import Flask, request, jsonify, render_template, g
 import anthropic
 import anti_abuse
 
 # ── paths ──────────────────────────────────────────────────────────────────
-# RENDERS_DIR/UPLOADS_DIR stay under static/ (Flask serves them at /static/...);
-# in a hardened container, mount writable volumes at those paths. The DB isn't
-# served, so POLY_DB_PATH is env-overridable to a writable volume — this is what
-# lets the app run on a read-only root filesystem. Defaults preserve the local layout.
+# RENDERS_DIR stays under static/ (Flask serves it at /static/renders/...);
+# in a hardened container, mount a writable volume there. The DB isn't served,
+# so POLY_DB_PATH is env-overridable to a writable volume — this is what lets
+# the app run on a read-only root filesystem. Defaults preserve the local layout.
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 RENDERS_DIR = os.path.join(BASE_DIR, "static", "renders")
-UPLOADS_DIR = os.path.join(BASE_DIR, "static", "uploads")
 DB_PATH     = os.environ.get("POLY_DB_PATH") or os.path.join(BASE_DIR, "poly.db")
 RENDERER    = os.path.join(BASE_DIR, "renderer.py")
 
 os.makedirs(RENDERS_DIR, exist_ok=True)
-os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 # inject renderer into path
 sys.path.insert(0, BASE_DIR)
 from renderer import render as poly_render, validate_scene as renderer_validate, SceneValidationError
 import sandbox
 import jobqueue
+import scene_json
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB upload limit
+# Text-only API (no uploads): cap request bodies at 1MB — generate only carries a
+# prompt + a few small form fields, so anything larger is junk/abuse.
+app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 
-# anti-abuse setup: pins PIL.MAX_IMAGE_PIXELS and syncs MAX_CONTENT_LENGTH to
-# MAX_UPLOAD_MB. This is the module's only side-effecting call.
+# anti-abuse setup: pins PIL.MAX_IMAGE_PIXELS (decompression-bomb ceiling for the
+# renderer). This is the module's only side-effecting call.
 anti_abuse.init(app)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# ── token cost accounting ────────────────────────────────────────────────────
+# Per-model Anthropic list price in USD per 1M tokens, (input, output). Keyed by
+# model-id prefix so a minor version bump (sonnet-4-6 -> 4-7) keeps its pricing
+# without a code change. Unknown models fall back to the Sonnet tier. Update if
+# Anthropic changes pricing; see https://docs.anthropic.com/en/docs/about-claude/pricing
+PRICING = {
+    "claude-opus":   (15.0, 75.0),
+    "claude-sonnet": (3.0, 15.0),
+    "claude-haiku":  (1.0, 5.0),
+}
+_DEFAULT_PRICING = (3.0, 15.0)
+
+
+def compute_cost(model, tokens_in, tokens_out):
+    """USD cost for one generation, from the stored model + token counts. Never
+    raises (cost reporting must not break a response); unknown models price at the
+    Sonnet tier."""
+    rate_in, rate_out = _DEFAULT_PRICING
+    for prefix, rates in PRICING.items():
+        if model and str(model).startswith(prefix):
+            rate_in, rate_out = rates
+            break
+    cost = (tokens_in or 0) / 1_000_000 * rate_in + (tokens_out or 0) / 1_000_000 * rate_out
+    return round(cost, 6)
 
 # Where scene code actually executes:
 #   "local"  — in a subprocess sandbox inside this process (default; simple dev).
@@ -40,17 +65,27 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 #              so this web tier never exec()s scene code (issue #2). See render_worker.py.
 RENDER_MODE = os.environ.get("RENDER_MODE", "local").strip().lower()
 
+# What the model is asked to produce, and which renderer path runs it:
+#   "python" — raw Pillow scene code, exec'd by renderer.render(). Expressive
+#              (Turing-complete) but a prompt-injection -> RCE surface, contained
+#              by the sandbox stack (AST allowlist + subprocess + network-less worker).
+#   "json"   — a declarative JSON scene drawn by renderer.render_json() over a
+#              fixed primitive set. No exec, so there is no RCE surface at all —
+#              the threat model shrinks to data validation. See scene_json.py.
+SCENE_FORMAT = os.environ.get("SCENE_FORMAT", "python").strip().lower()
 
-def _render_scene(scene_code, *, filename, width, height, seed, ref, preset):
+
+def _render_scene(scene_payload, *, filename, width, height, seed, preset):
     """Dispatch a render to the worker queue or the in-process sandbox. Both
-    return renderer.render()'s dict and raise the same exceptions."""
+    return the renderer's dict and raise the same exceptions. The scene format
+    (python/json) is taken from SCENE_FORMAT and selects the renderer path."""
     if RENDER_MODE == "worker":
         return jobqueue.submit_and_wait(
-            scene_code, filename=filename, width=width, height=height, seed=seed,
-            ref=ref, preset=preset, thumbnail=True, output_dir=RENDERS_DIR)
+            scene_payload, filename=filename, width=width, height=height, seed=seed,
+            preset=preset, thumbnail=True, output_dir=RENDERS_DIR, scene_format=SCENE_FORMAT)
     return sandbox.run_scene(
-        scene_code, filename=filename, width=width, height=height, seed=seed,
-        ref=ref, preset=preset, thumbnail=True, _output_dir=RENDERS_DIR)
+        scene_payload, filename=filename, width=width, height=height, seed=seed,
+        preset=preset, thumbnail=True, _output_dir=RENDERS_DIR, scene_format=SCENE_FORMAT)
 
 # ── DB ─────────────────────────────────────────────────────────────────────
 def get_db():
@@ -78,7 +113,9 @@ def init_db():
             height      INTEGER,
             tokens_in   INTEGER DEFAULT 0,
             tokens_out  INTEGER DEFAULT 0,
+            model       TEXT,
             scene_code  TEXT,
+            svg         TEXT,
             created_at  TEXT
         );
         CREATE TABLE IF NOT EXISTS folders (
@@ -100,6 +137,13 @@ def init_db():
             PRIMARY KEY (image_id, tag_id)
         );
         """)
+        # Auto-migrate older DBs so cost reporting (`model`) and the persistent
+        # SVG link (`svg`) work without a manual migration step.
+        cols = {r[1] for r in db.execute("PRAGMA table_info(images)").fetchall()}
+        if "model" not in cols:
+            db.execute("ALTER TABLE images ADD COLUMN model TEXT")
+        if "svg" not in cols:
+            db.execute("ALTER TABLE images ADD COLUMN svg TEXT")
     print("DB initialised")
 
 init_db()
@@ -107,10 +151,17 @@ init_db()
 # ── helpers ────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are the Pillow Polygons scene code generator.
 
-Given a user prompt (and optionally a reference image), output ONLY a Python code string — no markdown, no backticks, no explanation. Just raw Python drawing instructions.
+OUTPUT FORMAT — THIS IS A HARD REQUIREMENT:
+- Respond with raw Python source code and NOTHING else.
+- Do NOT wrap the code in markdown fences (no ``` or ```python).
+- Do NOT add any prose, explanation, comments-about-the-answer, or preamble
+  before or after the code. No "Here is..." and no closing remarks.
+- The FIRST character of your response must be the first character of Python
+  code, and the LAST character must be the last character of Python code.
+Any deviation from this format breaks the renderer.
 
 The following are pre-injected and available without importing:
-  img, draw, W, H, rng, ref, palette,
+  img, draw, W, H, rng, palette,
   Image, ImageDraw, ImageFont, math, random
 
 Rules:
@@ -129,7 +180,6 @@ Rules:
 - Use gradient backgrounds (scan line by line)
 - Build characters from polygons and ellipses with shadow/base/highlight layers
 - Eyes need socket → iris → pupil → gleam
-- If ref is provided, use ref.getpixel((x,y)) to sample dominant colors
 
 Available presets inject palette dict with keys: bg, atmosphere, accent, grain
 Always use palette.get('bg', (20,20,30)) style access — palette may be empty if no preset selected.
@@ -138,55 +188,219 @@ Available fonts (use try/except):
   /usr/share/fonts/truetype/google-fonts/Poppins-Bold.ttf
   /usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf
 
-Output raw Python only. Nothing else."""
+Remember the output format: raw Python only, no markdown fences, no prose. Nothing else."""
 
-def image_to_b64(path):
-    with open(path, "rb") as f:
-        return base64.standard_b64encode(f.read()).decode("utf-8")
 
-def call_claude(prompt, ref_path=None, preset=None, seed=42, model='claude-sonnet-4-6', ref_mime=None):
+SYSTEM_PROMPT_JSON = """You are the Pillow Polygons scene generator.
+
+Output a single JSON object that DESCRIBES the scene to draw — and NOTHING else.
+No markdown fences, no prose, no explanation. The response must be valid JSON,
+its first character '{' and its last character '}'.
+
+The canvas is W×H pixels, origin at the top-left, coordinates in pixels.
+
+Schema:
+{
+  "background": {"type": "gradient", "from": [r,g,b], "to": [r,g,b], "direction": "vertical"|"horizontal"},
+                 // OR {"type":"radial","inner":[r,g,b],"outer":[r,g,b],"cx":x,"cy":y,"r":n}
+                 // OR {"type":"solid","color":[r,g,b]} — omit to keep the preset background
+  "layers": [
+    {"alpha": 0-255,            // optional overall layer opacity, for soft glows/atmosphere
+     "ops": [ <op>, ... ]}
+  ]
+}
+
+Each <op> is exactly one of:
+  {"op":"polygon","points":[[x,y],...],"fill":<color>,"outline":<color>,"width":n}
+  {"op":"ellipse","bbox":[x0,y0,x1,y1],"fill":<color>,"outline":<color>,"width":n}
+  {"op":"rectangle","bbox":[x0,y0,x1,y1],"fill":<color>,"outline":<color>,"width":n}
+  {"op":"line","points":[[x,y],...],"fill":<color>,"width":n}
+  {"op":"arc","bbox":[x0,y0,x1,y1],"start":deg,"end":deg,"fill":<color>,"width":n}
+  {"op":"bezier","points":[[x,y]×3or4],"stroke":<color>,"fill":<color>,"width":n,"closed":false}
+                 // 3 points = quadratic, 4 = cubic; smooth curve. "fill" only if closed.
+  {"op":"point","points":[[x,y],...],"fill":<color>}
+  {"op":"text","xy":[x,y],"text":"...","fill":<color>,"size":n}
+  {"op":"grain","count":n,"fill":<color>,"alpha":a}   // n random 1px speckles for texture
+  {"op":"vignette","strength":0-255}                  // dark edge falloff; end scenes with this
+  {"op":"scatter","count":n,"area":[x0,y0,x1,y1],"shape":<leaf op around the origin>}
+                 // stamps `count` copies of shape at random spots in area (e.g. a star field)
+  {"op":"repeat","nx":a,"ny":b,"dx":px,"dy":px,"x0":px,"y0":px,"shape":<leaf op around the origin>}
+                 // stamps shape across an a×b grid (e.g. windows, tiles)
+
+<color> is [r,g,b] or [r,g,b,a] (0-255), or one of the palette key strings
+"bg", "atmosphere", or "accent".
+
+BE TOKEN-EFFICIENT — this matters:
+- NEVER enumerate many near-identical shapes by hand. For repetition use "scatter"
+  (random) or "repeat" (grid); for smooth curves use "bezier" (3-4 points) instead
+  of a long "points" list; for gradients use the gradient/radial background.
+- A scatter/repeat "shape" is defined around the origin (0,0) and is translated to
+  each placement — keep it small, e.g. {"op":"ellipse","bbox":[-2,-2,2,2],...}.
+- Aim for a compact scene: a few dozen ops is plenty. The expanding ops do the
+  heavy lifting so you write little.
+
+Composition guidance (match the house style):
+- Gradient or radial background, then build subjects from layered polygons +
+  ellipses with separate shadow / base / highlight layers.
+- Eyes: socket → iris → pupil → gleam. Use bezier for organic edges.
+- A low-alpha "scatter" or "grain" layer for texture; finish with a "vignette".
+
+Hard limits: ≤ 64 layers, ≤ 5000 ops, ≤ 2000 points/shape, ≤ 20000 expanded
+primitives total (scatter+repeat+grain). Output raw JSON only — nothing before
+'{' or after '}'."""
+
+def _strip_code_fences(text):
+    """Enforce the 'raw Python only' output contract on the model's behalf.
+
+    The system prompt demands no markdown, but models occasionally wrap the scene
+    code in a ```python ... ``` fence anyway. Rather than fail (and pay for a
+    retry), recover the code: if the response is fenced, drop the fence lines and
+    return the inner body. A response with no fence is returned unchanged.
+    """
+    s = (text or "").strip()
+    if not s.startswith("```"):
+        return s
+    lines = s.splitlines()
+    # Drop the opening fence (``` or ```python) ...
+    lines = lines[1:]
+    # ... and the closing fence if present.
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def call_claude(prompt, preset=None, seed=42, model='claude-sonnet-4-6', system=None):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    user_content = []
-
-    if ref_path and os.path.exists(ref_path):
-        # Use the MIME detected by validate_image_upload (the real content type),
-        # falling back to extension only if a caller didn't supply one.
-        if ref_mime:
-            mime = ref_mime
-        else:
-            ext = ref_path.rsplit(".", 1)[-1].lower()
-            mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                    "png": "image/png", "gif": "image/gif",
-                    "webp": "image/webp"}.get(ext, "image/jpeg")
-        user_content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": mime,
-                "data": image_to_b64(ref_path)
-            }
-        })
 
     preset_note = f"\nActive preset: {preset}" if preset else ""
     seed_note   = f"\nSeed: {seed}"
-    user_content.append({
+    user_content = [{
         "type": "text",
         "text": f"{prompt}{preset_note}{seed_note}"
-    })
+    }]
 
     response = client.messages.create(
         model=model,
         max_tokens=4096,
-        system=SYSTEM_PROMPT,
+        system=system or SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_content}]
     )
 
-    scene_code   = response.content[0].text.strip()
+    # Enforce the raw-Python output contract even if the model wrapped it in a
+    # markdown fence, so a stray ``` doesn't cost a syntax-error retry.
+    scene_code   = _strip_code_fences(response.content[0].text)
     tokens_in    = response.usage.input_tokens
     tokens_out   = response.usage.output_tokens
 
     return scene_code, tokens_in, tokens_out
+
+
+class SceneGenError(Exception):
+    """A scene the model couldn't produce acceptably. Carries the HTTP status and
+    (optionally) the offending scene text to echo back to the client."""
+    def __init__(self, message, status=400, scene=None):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.scene = scene
+
+
+def _check_syntax(code):
+    try:
+        compile(code, "<scene>", "exec")
+        return None
+    except SyntaxError as e:
+        return str(e)
+
+
+def _generate_python_scene(prompt, preset, seed, model):
+    """Python path: generate scene code, then gate it on a syntax check and the
+    AST sandbox, each with one Claude retry (a model slip shouldn't fail a legit
+    prompt). Returns (code, tokens_in, tokens_out) or raises SceneGenError."""
+    try:
+        code, tin, tout = call_claude(prompt, preset, seed, model)
+    except Exception as e:
+        raise SceneGenError(f"Claude API error: {e}", 500)
+
+    err = _check_syntax(code)
+    if err:
+        try:
+            code, ti, to = call_claude(
+                f"The following Python scene code has a syntax error: {err}\n\nFix it and "
+                f"return ONLY the corrected raw Python code — no markdown fences, no "
+                f"explanation, no prose:\n\n{code}", preset, seed, model)
+            tin += ti; tout += to
+        except Exception:
+            raise SceneGenError(f"Syntax error and fix failed: {err}", 500)
+        err2 = _check_syntax(code)
+        if err2:
+            raise SceneGenError(f"Syntax error persisted after retry: {err2}", 500, scene=code)
+
+    serr = renderer_validate(code)
+    if serr:
+        try:
+            code, ti, to = call_claude(
+                f"The following Python scene code was rejected by a security sandbox because: "
+                f"{serr}. Rewrite it to draw the same scene using ONLY the pre-injected names "
+                f"(img, draw, W, H, rng, palette, Image, ImageDraw, ImageFont, math, random) "
+                f"with no imports, no dunder attributes, and no eval/exec/open. Return ONLY the "
+                f"corrected raw Python code — no markdown fences, no explanation:\n\n{code}",
+                preset, seed, model)
+            tin += ti; tout += to
+        except Exception:
+            raise SceneGenError(f"Scene rejected by sandbox: {serr}", 400)
+        serr2 = renderer_validate(code)
+        if serr2:
+            raise SceneGenError(f"Scene rejected by sandbox: {serr2}", 400, scene=code)
+
+    return code, tin, tout
+
+
+def _parse_scene_json(raw):
+    """Return (scene_dict, None) or (None, error_str). Fences are tolerated."""
+    try:
+        scene = json.loads(_strip_code_fences(raw))
+    except (ValueError, TypeError) as e:
+        return None, f"not valid JSON ({e})"
+    err = scene_json.validate_scene_json(scene)
+    if err:
+        return None, err
+    return scene, None
+
+
+def _generate_json_scene(prompt, preset, seed, model):
+    """JSON path: generate a declarative scene, validate it against the schema,
+    one retry on a parse/schema miss. There is no code to sandbox here — a valid
+    scene is just data. Returns (scene_dict, tokens_in, tokens_out)."""
+    try:
+        raw, tin, tout = call_claude(prompt, preset, seed, model, system=SYSTEM_PROMPT_JSON)
+    except Exception as e:
+        raise SceneGenError(f"Claude API error: {e}", 500)
+
+    scene, err = _parse_scene_json(raw)
+    if err:
+        try:
+            raw, ti, to = call_claude(
+                f"Your previous response was rejected: {err}. Return ONLY a single valid JSON "
+                f"object matching the scene schema — no markdown fences, no prose:\n\n{raw}",
+                preset, seed, model, system=SYSTEM_PROMPT_JSON)
+            tin += ti; tout += to
+        except Exception:
+            raise SceneGenError(f"Scene rejected: {err}", 400)
+        scene, err2 = _parse_scene_json(raw)
+        if err2:
+            raise SceneGenError(f"Scene rejected after retry: {err2}", 400, scene=raw)
+
+    return scene, tin, tout
+
+
+def _scene_text(payload):
+    """Serialize a scene payload for storage / error echoes: code is already a
+    string; a JSON scene dict is dumped compactly."""
+    if isinstance(payload, str):
+        return payload
+    return json.dumps(payload)
+
 
 def row_to_dict(row):
     d = dict(row)
@@ -198,6 +412,12 @@ def row_to_dict(row):
     d["folders"] = [r["name"] for r in db.execute(
         "SELECT f.name FROM folders f JOIN image_folders if2 ON f.id=if2.folder_id WHERE if2.image_id=?", (img_id,)
     ).fetchall()]
+    # Derived, not stored: USD cost from the model + token counts (works for old
+    # rows too — a NULL model just prices at the default tier).
+    d["cost_usd"] = compute_cost(d.get("model"), d.get("tokens_in"), d.get("tokens_out"))
+    # SVG link from the stored basename, so the download button survives reloads
+    # and gallery selection (not just the immediate generate response).
+    d["svg_url"] = f"/static/renders/{d['svg']}" if d.get("svg") else None
     return d
 
 # ── routes: pages ──────────────────────────────────────────────────────────
@@ -249,99 +469,36 @@ def generate():
     if verdict["action"] != "allow":
         return jsonify({"error": f"Prompt rejected: {verdict['reason']}"}), 400
 
-    # ── handle optional ref image: validate + sanitize, never trust the bytes ──
-    ref_path = None
-    ref_pil  = None
-    ref_mime = None
-    if "ref" in request.files and request.files["ref"].filename:
-        try:
-            clean = anti_abuse.validate_image_upload(request.files["ref"])
-        except anti_abuse.UploadRejected as e:
-            return jsonify({"error": e.message}), e.status
-        img_verdict = anti_abuse.moderate_image(clean.image, mod_client)
-        if img_verdict["action"] != "allow":
-            return jsonify({"error": f"Reference image rejected: {img_verdict['reason']}"}), 400
-        ref_name = f"{uuid.uuid4().hex}.{clean.ext}"
-        ref_path = os.path.join(UPLOADS_DIR, ref_name)
-        clean.save(ref_path)          # re-encoded, EXIF/polyglot stripped
-        ref_pil  = clean.image
-        ref_mime = clean.mime
-        # Delete the ref after the request finishes (no TTL sweep needed):
-        # uploads/ is otherwise write-only and never pruned.
-        @after_this_request
-        def _drop_ref(response, _p=ref_path):
-            try:
-                if os.path.exists(_p):
-                    os.remove(_p)
-            except OSError:
-                pass
-            return response
-
     model = request.form.get('model', 'claude-sonnet-4-6')
     try:
-        scene_code, tokens_in, tokens_out = call_claude(prompt, ref_path, preset, seed, model, ref_mime)
-    except Exception as e:
-        return jsonify({"error": f"Claude API error: {e}"}), 500
-
-    # syntax check — retry once if bad
-    def check_syntax(code):
-        try:
-            compile(code, "<scene>", "exec")
-            return None
-        except SyntaxError as e:
-            return str(e)
-
-    syntax_err = check_syntax(scene_code)
-    if syntax_err:
-        try:
-            fix_prompt = f"The following Python scene code has a syntax error: {syntax_err}\n\nFix it and return only the corrected code, no explanation:\n\n{scene_code}"
-            scene_code, tokens_in2, tokens_out2 = call_claude(fix_prompt, None, preset, seed, model)
-            tokens_in  += tokens_in2
-            tokens_out += tokens_out2
-        except Exception as e:
-            return jsonify({"error": f"Syntax error and fix failed: {syntax_err}"}), 500
-        syntax_err2 = check_syntax(scene_code)
-        if syntax_err2:
-            return jsonify({"error": f"Syntax error persisted after retry: {syntax_err2}", "scene_code": scene_code}), 500
-
-    # sandbox safety check — reject scene code that uses forbidden constructs
-    # (imports, dunder access, os/eval/exec, etc.). Retry once asking Claude to
-    # remove them, since an occasional model slip shouldn't fail a legit prompt.
-    safety_err = renderer_validate(scene_code)
-    if safety_err:
-        try:
-            fix_prompt = (f"The following Python scene code was rejected by a security sandbox "
-                          f"because: {safety_err}. Rewrite it to draw the same scene using ONLY "
-                          f"the pre-injected names (img, draw, W, H, rng, ref, palette, Image, "
-                          f"ImageDraw, ImageFont, math, random) with no imports, no dunder "
-                          f"attributes, and no eval/exec/open. Return only the corrected code:\n\n{scene_code}")
-            scene_code, tokens_in3, tokens_out3 = call_claude(fix_prompt, None, preset, seed, model)
-            tokens_in  += tokens_in3
-            tokens_out += tokens_out3
-        except Exception:
-            return jsonify({"error": f"Scene rejected by sandbox: {safety_err}"}), 400
-        safety_err2 = renderer_validate(scene_code)
-        if safety_err2:
-            return jsonify({"error": f"Scene rejected by sandbox: {safety_err2}", "scene_code": scene_code}), 400
+        if SCENE_FORMAT == "json":
+            scene_payload, tokens_in, tokens_out = _generate_json_scene(prompt, preset, seed, model)
+        else:
+            scene_payload, tokens_in, tokens_out = _generate_python_scene(prompt, preset, seed, model)
+    except SceneGenError as e:
+        body = {"error": e.message}
+        if e.scene is not None:
+            body["scene_code"] = e.scene
+        return jsonify(body), e.status
 
     # render — in-process sandbox (local) or the network-less worker (worker mode)
     img_id   = uuid.uuid4().hex
     filename = f"{img_id}.png"
 
+    scene_text = _scene_text(scene_payload)
     try:
         result = _render_scene(
-            scene_code, filename=filename,
-            width=width, height=height, seed=seed,
-            ref=ref_pil, preset=preset
+            scene_payload, filename=filename,
+            width=width, height=height, seed=seed, preset=preset
         )
     except SceneValidationError as e:
-        return jsonify({"error": f"Scene rejected by sandbox: {e}", "scene_code": scene_code}), 400
+        return jsonify({"error": f"Scene rejected by sandbox: {e}", "scene_code": scene_text}), 400
     except sandbox.RenderTimeout as e:
         return jsonify({"error": f"Render timed out: {e}"}), 400
     except sandbox.RenderError as e:
-        return jsonify({"error": f"Render error: {e}", "scene_code": scene_code}), 500
+        return jsonify({"error": f"Render error: {e}", "scene_code": scene_text}), 500
     except Exception as e:
-        return jsonify({"error": f"Render error: {e}", "scene_code": scene_code}), 500
+        return jsonify({"error": f"Render error: {e}", "scene_code": scene_text}), 500
 
     thumb_name = os.path.basename(result["thumb"]) if result.get("thumb") else None
     svg_name   = os.path.basename(result["svg"])   if result.get("svg")   else None
@@ -350,17 +507,17 @@ def generate():
     db = get_db()
     db.execute("""
         INSERT INTO images (id, filename, thumb, prompt, preset, seed, width, height,
-                            tokens_in, tokens_out, scene_code, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                            tokens_in, tokens_out, model, scene_code, svg, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (img_id, filename, thumb_name, prompt, preset, seed, width, height,
-          tokens_in, tokens_out, scene_code, created_at))
+          tokens_in, tokens_out, model, scene_text, svg_name, created_at))
     db.commit()
 
     row = db.execute("SELECT * FROM images WHERE id=?", (img_id,)).fetchone()
+    # svg_url comes from row_to_dict (stored column); url/thumb_url are per-request.
     return jsonify({**row_to_dict(row),
                     "url":       f"/static/renders/{filename}",
-                    "thumb_url": f"/static/renders/{thumb_name}" if thumb_name else None,
-                    "svg_url":   f"/static/renders/{svg_name}"   if svg_name   else None})
+                    "thumb_url": f"/static/renders/{thumb_name}" if thumb_name else None})
 
 # ── routes: images ─────────────────────────────────────────────────────────
 @app.route("/api/images")
