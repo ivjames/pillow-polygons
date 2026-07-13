@@ -99,6 +99,34 @@ def test_rce_payload_cannot_reach_os_via_render():
     assert raised, "render() executed a frame-walk RCE instead of rejecting it"
 
 
+def test_inverted_bbox_renders_instead_of_erroring():
+    """A box-based op given an inverted box (x1<x0 / y1<y0) — a routine model slip
+    when boxes are computed as center±radius — used to raise Pillow's
+    'x1 must be greater than or equal to x0' and fail the whole render. The
+    renderer now normalizes the box so the shape just draws. Also covers a draw
+    re-acquired via ImageDraw.Draw(img), as the system prompt instructs."""
+    scene = (
+        'img = Image.new("RGB", (W, H), (10, 10, 20))\n'
+        'draw = ImageDraw.Draw(img)\n'
+        'cx, cy, r = W // 2, H // 2, 40\n'
+        'draw.ellipse([cx + r, cy + r, cx - r, cy - r], fill=(200, 120, 80))\n'
+        'draw.rectangle([80, 80, 20, 20], fill=(80, 200, 120))\n'
+        'draw.arc([60, 60, 10, 10], start=0, end=180, fill=(255, 255, 255), width=3)\n'
+        'layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))\n'
+        'img = Image.alpha_composite(img.convert("RGBA"), layer).convert("RGB")\n'
+        'draw = ImageDraw.Draw(img)\n'          # re-acquired: must still be guarded
+        'draw.ellipse([cx + r, cy + r, cx - r, cy - r], outline=(255, 0, 0), width=2)\n'
+        'svg.rectangle([70, 70, 10, 10], fill=(0, 255, 0))\n'
+    )
+    assert validate_scene(scene) is None
+    with tempfile.TemporaryDirectory() as d:
+        res = render(scene, filename="inv.png", width=128, height=128, _output_dir=d)
+        assert os.path.exists(res["png"]), "inverted-bbox scene produced no PNG"
+        # the SVG twin must not carry a negative-dimension <rect>
+        svg = open(res["svg"]).read()
+        assert 'width="-' not in svg and 'height="-' not in svg
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
