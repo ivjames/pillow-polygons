@@ -18,7 +18,7 @@ os.makedirs(RENDERS_DIR, exist_ok=True)
 
 # inject renderer into path
 sys.path.insert(0, BASE_DIR)
-from renderer import render as poly_render, validate_scene as renderer_validate, SceneValidationError, PRESETS
+from renderer import render as poly_render, validate_scene as renderer_validate, SceneValidationError, PRESETS, PRESET_INFO
 import sandbox
 import jobqueue
 import scene_json
@@ -522,6 +522,21 @@ def row_to_dict(row, include_scene=True, tags=None, folders=None):
     d["svg_url"] = f"/static/renders/{d['svg']}" if d.get("svg") else None
     return d
 
+def _preset_ui():
+    """The preset picker's data, derived from renderer.PRESET_INFO so the buttons
+    and popovers never drift from the palettes the renderer actually uses. Leads
+    with a 'None' entry, and gives each a swatch (its accent color) for the chip."""
+    def hexc(rgb):
+        r, g, b = rgb[:3]
+        return f"#{r:02x}{g:02x}{b:02x}"
+    ui = [{"name": "", "label": "None",
+           "description": "No preset — a neutral dark palette; the scene picks its own colors.",
+           "swatch": "#2a2a3a"}]
+    ui += [{"name": p["name"], "label": p["label"], "description": p["description"],
+            "swatch": hexc(p["accent"])} for p in PRESET_INFO]
+    return ui
+
+
 # ── routes: pages ──────────────────────────────────────────────────────────
 @app.route("/")
 def index():
@@ -531,7 +546,8 @@ def index():
     # alongside CAPTCHA_SECRET (server) for CAPTCHA to work in a browser.
     return render_template("index.html",
                            form_token=anti_abuse.make_form_token(),
-                           captcha_sitekey=os.environ.get("CAPTCHA_SITEKEY", ""))
+                           captcha_sitekey=os.environ.get("CAPTCHA_SITEKEY", ""),
+                           presets=_preset_ui())
 
 # ── routes: generation ─────────────────────────────────────────────────────
 @app.route("/api/generate", methods=["POST"])

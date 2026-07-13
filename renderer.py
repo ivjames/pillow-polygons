@@ -108,12 +108,40 @@ def validate_scene(code):
                 return f"use of '{node.id}' is not allowed"
     return None
 
-PRESETS = {
-    "night":  {"bg": (8,10,22),   "atmosphere": (15,20,45,60),  "accent": (180,210,255), "grain": 3000},
-    "golden": {"bg": (38,28,12),  "atmosphere": (80,55,20,50),  "accent": (240,195,80),  "grain": 2000},
-    "swamp":  {"bg": (8,18,12),   "atmosphere": (20,50,28,55),  "accent": (70,160,90),   "grain": 2500},
-    "bone":   {"bg": (210,200,185),"atmosphere": (180,168,148,40),"accent": (90,70,50),  "grain": 1500},
-}
+# One source of truth for presets: palette colors PLUS the human-facing label and
+# an honest, literal description of what the theme does to the sky. The UI renders
+# its buttons and popovers from this list (so they can't drift from the renderer),
+# and PRESETS below — colors only, what the renderer/palette consumes — is derived
+# from it. Descriptions state brightness plainly (e.g. golden is dusk, not midday)
+# so the picker doesn't let users assume the wrong thing.
+_PALETTE_KEYS = ("bg", "atmosphere", "accent", "grain")
+PRESET_INFO = [
+    {"name": "night",  "label": "Night",
+     "description": "Deep near-black night in cool blues — starlit, low-light mood.",
+     "bg": (8,10,22),    "atmosphere": (15,20,45,60),   "accent": (180,210,255), "grain": 3000},
+    {"name": "golden", "label": "Golden",
+     "description": "Warm golden-hour dusk: a dark amber sky. Not a bright daytime look.",
+     "bg": (38,28,12),   "atmosphere": (80,55,20,50),   "accent": (240,195,80),  "grain": 2000},
+    {"name": "swamp",  "label": "Swamp",
+     "description": "Murky low-light bog — muted greens, dim and moody.",
+     "bg": (8,18,12),    "atmosphere": (20,50,28,55),   "accent": (70,160,90),   "grain": 2500},
+    {"name": "bone",   "label": "Bone",
+     "description": "Pale bleached daylight — a light off-white / tan background.",
+     "bg": (210,200,185),"atmosphere": (180,168,148,40),"accent": (90,70,50),    "grain": 1500},
+    {"name": "day",    "label": "Day",
+     "description": "Bright blue midday sky, light and airy — the sunny-day look.",
+     "bg": (206,231,250),"atmosphere": (120,175,235,50),"accent": (255,224,130), "grain": 700},
+    {"name": "dawn",   "label": "Dawn",
+     "description": "Soft sunrise — peach horizon fading to light periwinkle. Warm and gentle.",
+     "bg": (255,206,178),"atmosphere": (150,140,200,55),"accent": (255,168,120), "grain": 1200},
+    {"name": "storm",  "label": "Storm",
+     "description": "Grey overcast — flat, muted, low-contrast slate.",
+     "bg": (120,126,136),"atmosphere": (86,92,102,60),  "accent": (206,212,222), "grain": 2200},
+    {"name": "neon",   "label": "Neon",
+     "description": "Saturated retro glow — violet-to-magenta sky with a cyan accent.",
+     "bg": (232,48,150), "atmosphere": (70,18,110,60),  "accent": (72,232,226),  "grain": 1200},
+]
+PRESETS = {p["name"]: {k: p[k] for k in _PALETTE_KEYS} for p in PRESET_INFO}
 
 
 class SVGRecorder:

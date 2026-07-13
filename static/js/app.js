@@ -46,6 +46,22 @@ document.querySelectorAll(".preset-btn").forEach(btn => {
 });
 document.querySelector('.preset-btn[data-preset=""]').classList.add("active");
 
+/* ── Preset info popovers (tap to toggle; hover also shows via CSS on desktop) ── */
+function closePresetPops() {
+  document.querySelectorAll(".preset-pop.show").forEach(p => p.classList.remove("show"));
+  document.querySelectorAll('.preset-info[aria-expanded="true"]').forEach(i => i.setAttribute("aria-expanded", "false"));
+}
+document.querySelectorAll(".preset-info").forEach(info => {
+  info.addEventListener("click", (e) => {
+    e.stopPropagation();                       // don't select the preset
+    const pop  = info.parentElement.querySelector(".preset-pop");
+    const open = pop.classList.contains("show");
+    closePresetPops();
+    if (!open) { pop.classList.add("show"); info.setAttribute("aria-expanded", "true"); }
+  });
+});
+document.addEventListener("click", closePresetPops);   // tap elsewhere dismisses
+
 /* ── Seed random ── */
 $("random-seed").addEventListener("click", () => {
   seedInput.value = Math.floor(Math.random() * 99999);
