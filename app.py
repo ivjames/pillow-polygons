@@ -537,6 +537,20 @@ def _preset_ui():
     return ui
 
 
+@app.context_processor
+def _asset_versions():
+    """Expose static_v('css/app.css') to templates → the file's mtime, appended as
+    a ?v= cache-buster. A deploy (git pull) bumps the mtime, so browsers refetch
+    changed CSS/JS instead of serving a stale copy (which silently masked the new
+    preset-popover styles behind an old app.css)."""
+    def static_v(rel):
+        try:
+            return str(int(os.path.getmtime(os.path.join(BASE_DIR, "static", rel))))
+        except OSError:
+            return "0"
+    return {"static_v": static_v}
+
+
 # ── routes: pages ──────────────────────────────────────────────────────────
 @app.route("/")
 def index():

@@ -6,7 +6,7 @@
 <title>Pillow Polygons</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/static/css/app.css">
+<link rel="stylesheet" href="/static/css/app.css?v={{ static_v('css/app.css') }}">
 {% if captcha_sitekey %}
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 {% endif %}
@@ -197,6 +197,6 @@
       <div class="lightbox-caption" id="lightbox-caption"></div>
     </div>
   </div>
-  <script src="/static/js/app.js"></script>
+  <script src="/static/js/app.js?v={{ static_v('js/app.js') }}"></script>
 </body>
 </html>
