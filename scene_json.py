@@ -454,8 +454,11 @@ def _grain(op, draw, W, H, rng):
 def _vignette(draw, W, H, strength):
     strength = int(max(0, min(255, _num(strength, 85))))
     m = min(W, H) // 2 or 1
+    # Darken the edges, fade to clear at the center: alpha is highest on the
+    # outermost ring (r=0) and 0 at the innermost (r→m). (The ramp used to run the
+    # other way, which darkened the *center* — a dark box in the middle.)
     for r in range(0, m, 10):
-        a = int(strength * (r / m))
+        a = int(strength * (1 - r / m))
         draw.rectangle([r, r, W - r, H - r], outline=(0, 0, 0, a), width=10)
 
 
