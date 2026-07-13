@@ -40,7 +40,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 # without a code change. Unknown models fall back to the Sonnet tier. Update if
 # Anthropic changes pricing; see https://docs.anthropic.com/en/docs/about-claude/pricing
 PRICING = {
-    "claude-opus":   (15.0, 75.0),
+    "claude-opus":   (5.0, 25.0),
     "claude-sonnet": (3.0, 15.0),
     "claude-haiku":  (1.0, 5.0),
 }
