@@ -18,7 +18,7 @@ os.makedirs(RENDERS_DIR, exist_ok=True)
 
 # inject renderer into path
 sys.path.insert(0, BASE_DIR)
-from renderer import render as poly_render, validate_scene as renderer_validate, SceneValidationError
+from renderer import render as poly_render, validate_scene as renderer_validate, SceneValidationError, PRESETS
 import sandbox
 import jobqueue
 import scene_json
@@ -177,12 +177,17 @@ Rules:
         vd.rectangle([r,r,W-r,H-r], outline=(0,0,0,a), width=10)
     img = Image.alpha_composite(img.convert("RGBA"),vig).convert("RGB")
     draw = ImageDraw.Draw(img)
-- Use gradient backgrounds (scan line by line)
+- Paint the background as a vertical gradient scanned line by line, built FROM the
+  palette: interpolate from palette['atmosphere'][:3] at the top to palette['bg']
+  at the bottom. The sky must take the active preset's colors — never a hardcoded
+  dark or black sky. (With no preset, palette['bg'] is a dark neutral; that's fine.)
 - Build characters from polygons and ellipses with shadow/base/highlight layers
 - Eyes need socket → iris → pupil → gleam
 
 Available presets inject palette dict with keys: bg, atmosphere, accent, grain
-Always use palette.get('bg', (20,20,30)) style access — palette may be empty if no preset selected.
+Always use palette.get('bg', (20,20,30)) / palette.get('atmosphere', (30,30,50,40))
+style access (atmosphere is an RGBA tuple — slice [:3] for gradient fills). palette
+may be empty if no preset is selected.
 Available fonts (use try/except):
   /usr/share/fonts/truetype/google-fonts/Poppins-Light.ttf
   /usr/share/fonts/truetype/google-fonts/Poppins-Bold.ttf
@@ -279,11 +284,26 @@ def _strip_code_fences(text):
 MAX_OUTPUT_TOKENS = 8192
 
 
+def _palette_note(preset):
+    """Give the model the selected preset's concrete colors so it paints the sky
+    from them. Without this the model only knew the preset *name* and defaulted to
+    a near-black sky — and since 3 of the 4 presets have a near-black `bg`, every
+    theme rendered black. `atmosphere` is the light, theme-distinct tint, so steer
+    the background gradient atmosphere→bg. Empty string when no preset is set."""
+    p = PRESETS.get(preset) if preset else None
+    if not p:
+        return ""
+    return (f" — palette colors: bg={p['bg']}, atmosphere={p['atmosphere']}, "
+            f"accent={p['accent']}. Paint the background/sky as a gradient from "
+            f"atmosphere (top) to bg (bottom) so it takes the preset's colors; do "
+            f"NOT hardcode a dark or black sky.")
+
+
 def call_claude(prompt, preset=None, seed=42, model='claude-sonnet-4-6', system=None,
                 max_tokens=MAX_OUTPUT_TOKENS):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    preset_note = f"\nActive preset: {preset}" if preset else ""
+    preset_note = f"\nActive preset: {preset}{_palette_note(preset)}" if preset else ""
     seed_note   = f"\nSeed: {seed}"
     user_content = [{
         "type": "text",
