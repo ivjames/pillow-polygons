@@ -269,7 +269,18 @@ def _strip_code_fences(text):
     return "\n".join(lines).strip()
 
 
-def call_claude(prompt, preset=None, seed=42, model='claude-sonnet-4-6', system=None):
+# The house style (layered polygons, per-line gradients, socket→iris→pupil eyes)
+# makes the generated scene code run long. At 4096 output tokens a detailed scene
+# was truncated mid-statement: the cut-off tail left an unclosed '(' that surfaced
+# as a bogus "syntax error", and because the fix-retry re-hit the same cap it
+# "persisted after retry". Give the generator real headroom — output tokens are
+# billed only when actually produced, so a higher ceiling costs nothing on the
+# common (short) case — and report truncation to callers as truncation.
+MAX_OUTPUT_TOKENS = 8192
+
+
+def call_claude(prompt, preset=None, seed=42, model='claude-sonnet-4-6', system=None,
+                max_tokens=MAX_OUTPUT_TOKENS):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     preset_note = f"\nActive preset: {preset}" if preset else ""
@@ -281,7 +292,7 @@ def call_claude(prompt, preset=None, seed=42, model='claude-sonnet-4-6', system=
 
     response = client.messages.create(
         model=model,
-        max_tokens=4096,
+        max_tokens=max_tokens,
         system=system or SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_content}]
     )
@@ -291,8 +302,12 @@ def call_claude(prompt, preset=None, seed=42, model='claude-sonnet-4-6', system=
     scene_code   = _strip_code_fences(response.content[0].text)
     tokens_in    = response.usage.input_tokens
     tokens_out   = response.usage.output_tokens
+    # stop_reason == "max_tokens" means the response was cut off before the model
+    # finished — the scene is incomplete, not merely malformed. Surface it so the
+    # caller doesn't mistake the truncated tail for a genuine syntax/schema error.
+    truncated    = response.stop_reason == "max_tokens"
 
-    return scene_code, tokens_in, tokens_out
+    return scene_code, tokens_in, tokens_out, truncated
 
 
 class SceneGenError(Exception):
@@ -318,14 +333,34 @@ def _generate_python_scene(prompt, preset, seed, model):
     AST sandbox, each with one Claude retry (a model slip shouldn't fail a legit
     prompt). Returns (code, tokens_in, tokens_out) or raises SceneGenError."""
     try:
-        code, tin, tout = call_claude(prompt, preset, seed, model)
+        code, tin, tout, truncated = call_claude(prompt, preset, seed, model)
     except Exception as e:
         raise SceneGenError(f"Claude API error: {e}", 500)
+
+    # A truncated response is an incomplete program — the cut-off tail reads as a
+    # syntax error ("'(' was never closed"), which a syntax-fix retry can't repair
+    # (it just re-hits the cap). Handle it as truncation: retry once asking for a
+    # COMPLETE, more compact scene, then give up with an honest message.
+    if truncated:
+        try:
+            code, ti, to, truncated = call_claude(
+                "Your previous scene was cut off before it finished. Produce a COMPLETE, "
+                "self-contained scene that fits comfortably within the output limit — favor "
+                "compact loops and fewer hand-written shapes over exhaustive detail. Return "
+                f"ONLY raw Python code — no markdown fences, no prose — for this prompt:\n\n{prompt}",
+                preset, seed, model)
+            tin += ti; tout += to
+        except Exception as e:
+            raise SceneGenError(f"Claude API error: {e}", 500)
+        if truncated:
+            raise SceneGenError(
+                "Scene generation exceeded the output length limit even after a retry — "
+                "try a simpler prompt or fewer details.", 500, scene=code)
 
     err = _check_syntax(code)
     if err:
         try:
-            code, ti, to = call_claude(
+            code, ti, to, _ = call_claude(
                 f"The following Python scene code has a syntax error: {err}\n\nFix it and "
                 f"return ONLY the corrected raw Python code — no markdown fences, no "
                 f"explanation, no prose:\n\n{code}", preset, seed, model)
@@ -339,7 +374,7 @@ def _generate_python_scene(prompt, preset, seed, model):
     serr = renderer_validate(code)
     if serr:
         try:
-            code, ti, to = call_claude(
+            code, ti, to, _ = call_claude(
                 f"The following Python scene code was rejected by a security sandbox because: "
                 f"{serr}. Rewrite it to draw the same scene using ONLY the pre-injected names "
                 f"(img, draw, W, H, rng, palette, Image, ImageDraw, ImageFont, math, random) "
@@ -373,14 +408,33 @@ def _generate_json_scene(prompt, preset, seed, model):
     one retry on a parse/schema miss. There is no code to sandbox here — a valid
     scene is just data. Returns (scene_dict, tokens_in, tokens_out)."""
     try:
-        raw, tin, tout = call_claude(prompt, preset, seed, model, system=SYSTEM_PROMPT_JSON)
+        raw, tin, tout, truncated = call_claude(prompt, preset, seed, model, system=SYSTEM_PROMPT_JSON)
     except Exception as e:
         raise SceneGenError(f"Claude API error: {e}", 500)
+
+    # A truncated response is incomplete JSON — it fails to parse as an unclosed
+    # object, which the schema-fix retry can't repair (it re-hits the cap). Handle
+    # it as truncation: retry once for a COMPLETE, compact scene, then give up.
+    if truncated:
+        try:
+            raw, ti, to, truncated = call_claude(
+                "Your previous JSON scene was cut off before it finished. Produce a COMPLETE, "
+                "compact scene — use scatter/repeat/bezier and gradient backgrounds instead of "
+                "enumerating many shapes. Return ONLY a single valid JSON object — no prose — "
+                f"for this prompt:\n\n{prompt}",
+                preset, seed, model, system=SYSTEM_PROMPT_JSON)
+            tin += ti; tout += to
+        except Exception as e:
+            raise SceneGenError(f"Claude API error: {e}", 500)
+        if truncated:
+            raise SceneGenError(
+                "Scene generation exceeded the output length limit even after a retry — "
+                "try a simpler prompt or fewer details.", 500, scene=raw)
 
     scene, err = _parse_scene_json(raw)
     if err:
         try:
-            raw, ti, to = call_claude(
+            raw, ti, to, _ = call_claude(
                 f"Your previous response was rejected: {err}. Return ONLY a single valid JSON "
                 f"object matching the scene schema — no markdown fences, no prose:\n\n{raw}",
                 preset, seed, model, system=SYSTEM_PROMPT_JSON)
