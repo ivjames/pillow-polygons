@@ -163,24 +163,15 @@ The following are pre-injected and available without importing:
   img, draw, W, H, rng,
   Image, ImageDraw, ImageFont, math, random
 
-Rules:
+Draw exactly what the prompt describes and nothing more. Do not add scenery,
+effects, backgrounds, vignettes, grain, borders, framing, or any embellishment
+the prompt does not ask for.
+
+Rules (mechanical only):
 - Use rng (not random) for all randomness
 - After every alpha_composite, re-acquire draw:
     img = Image.alpha_composite(img.convert("RGBA"), layer).convert("RGB")
     draw = ImageDraw.Draw(img)
-- Always end with a vignette that darkens the EDGES and fades to clear at the
-  CENTER (alpha highest on the outer ring, 0 in the middle):
-    vig = Image.new("RGBA",(W,H),(0,0,0,0))
-    vd = ImageDraw.Draw(vig)
-    for r in range(0,min(W,H)//2,10):
-        a = int(85*(1 - r/(min(W,H)//2)))
-        vd.rectangle([r,r,W-r,H-r], outline=(0,0,0,a), width=10)
-    img = Image.alpha_composite(img.convert("RGBA"),vig).convert("RGB")
-    draw = ImageDraw.Draw(img)
-- Paint the background as a vertical gradient scanned line by line, choosing colors
-  that suit the scene (interpolate top→bottom for a natural sky).
-- Build characters from polygons and ellipses with shadow/base/highlight layers
-- Eyes need socket → iris → pupil → gleam
 
 Available fonts (use try/except):
   /usr/share/fonts/truetype/google-fonts/Poppins-Light.ttf
@@ -220,7 +211,7 @@ Each <op> is exactly one of:
   {"op":"point","points":[[x,y],...],"fill":<color>}
   {"op":"text","xy":[x,y],"text":"...","fill":<color>,"size":n}
   {"op":"grain","count":n,"fill":<color>,"alpha":a}   // n random 1px speckles for texture
-  {"op":"vignette","strength":0-255}                  // dark edge falloff; end scenes with this
+  {"op":"vignette","strength":0-255}                  // dark edge falloff
   {"op":"scatter","count":n,"area":[x0,y0,x1,y1],"shape":<leaf op around the origin>}
                  // stamps `count` copies of shape at random spots in area (e.g. a star field)
   {"op":"repeat","nx":a,"ny":b,"dx":px,"dy":px,"x0":px,"y0":px,"shape":<leaf op around the origin>}
@@ -237,11 +228,10 @@ BE TOKEN-EFFICIENT — this matters:
 - Aim for a compact scene: a few dozen ops is plenty. The expanding ops do the
   heavy lifting so you write little.
 
-Composition guidance (match the house style):
-- Gradient or radial background, then build subjects from layered polygons +
-  ellipses with separate shadow / base / highlight layers.
-- Eyes: socket → iris → pupil → gleam. Use bezier for organic edges.
-- A low-alpha "scatter" or "grain" layer for texture; finish with a "vignette".
+Describe exactly what the prompt asks for and nothing more. Do not add
+backgrounds, effects, grain, vignettes, borders, or any embellishment the prompt
+does not call for. The ops above are a palette to draw from only as the prompt
+requires — none are mandatory.
 
 Hard limits: ≤ 64 layers, ≤ 5000 ops, ≤ 2000 points/shape, ≤ 20000 expanded
 primitives total (scatter+repeat+grain). Output raw JSON only — nothing before
@@ -267,13 +257,12 @@ def _strip_code_fences(text):
     return "\n".join(lines).strip()
 
 
-# The house style (layered polygons, per-line gradients, socket→iris→pupil eyes)
-# makes the generated scene code run long. At 4096 output tokens a detailed scene
-# was truncated mid-statement: the cut-off tail left an unclosed '(' that surfaced
-# as a bogus "syntax error", and because the fix-retry re-hit the same cap it
-# "persisted after retry". Give the generator real headroom — output tokens are
-# billed only when actually produced, so a higher ceiling costs nothing on the
-# common (short) case — and report truncation to callers as truncation.
+# A detailed scene can run long. At 4096 output tokens one was truncated
+# mid-statement: the cut-off tail left an unclosed '(' that surfaced as a bogus
+# "syntax error", and because the fix-retry re-hit the same cap it "persisted
+# after retry". Give the generator real headroom — output tokens are billed only
+# when actually produced, so a higher ceiling costs nothing on the common (short)
+# case — and report truncation to callers as truncation.
 MAX_OUTPUT_TOKENS = 8192
 
 
