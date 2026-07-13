@@ -40,7 +40,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 # without a code change. Unknown models fall back to the Sonnet tier. Update if
 # Anthropic changes pricing; see https://docs.anthropic.com/en/docs/about-claude/pricing
 PRICING = {
-    "claude-opus":   (15.0, 75.0),
+    "claude-opus":   (5.0, 25.0),
     "claude-sonnet": (3.0, 15.0),
     "claude-haiku":  (1.0, 5.0),
 }
@@ -456,8 +456,13 @@ def _scene_text(payload):
     return json.dumps(payload)
 
 
-def row_to_dict(row):
+def row_to_dict(row, include_scene=True):
     d = dict(row)
+    # scene_code is the full generated source (multi-KB per Python scene) and the
+    # client never reads it — the gallery list drops it to keep the list response
+    # small. The single-image generate response keeps it (include_scene=True).
+    if not include_scene:
+        d.pop("scene_code", None)
     db = get_db()
     img_id = d["id"]
     d["tags"] = [r["name"] for r in db.execute(
@@ -599,8 +604,18 @@ def list_images():
     if wheres: sql += " WHERE " + " AND ".join(wheres)
     sql += " ORDER BY i.created_at DESC"
 
+    # Optional pagination: bound the response when the caller passes ?limit (and
+    # optionally ?offset). No default cap, so the gallery's existing behavior is
+    # unchanged — this is a knob, not a forced page size.
+    if request.args.get("limit") is not None:
+        lim = anti_abuse.safe_int(request.args.get("limit"), 100, 1, 1000)
+        off = anti_abuse.safe_int(request.args.get("offset", 0), 0, 0, 100_000_000)
+        sql += " LIMIT ? OFFSET ?"; params += [lim, off]
+
     rows = db.execute(sql, params).fetchall()
-    return jsonify([{**row_to_dict(r),
+    # include_scene=False drops the unused scene_code column from every row —
+    # the bulk of the old list payload.
+    return jsonify([{**row_to_dict(r, include_scene=False),
                      "url": f"/static/renders/{r['filename']}",
                      "thumb_url": f"/static/renders/{r['thumb']}"} for r in rows])
 
