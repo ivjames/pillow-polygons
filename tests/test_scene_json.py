@@ -15,6 +15,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from PIL import Image                                    # noqa: E402
 import scene_json                                        # noqa: E402
 import renderer                                          # noqa: E402
 
@@ -72,6 +73,18 @@ def test_valid_scene_renders_png_and_svg():
         assert os.path.exists(res["png"]), "no PNG produced"
         assert res["svg"] and os.path.exists(res["svg"]), "expected an SVG twin from vector ops"
         assert res["meta"]["format"] == "json"
+
+
+def test_vignette_darkens_edges_not_center():
+    # Regression: the vignette ramp was inverted, darkening the center (a dark box
+    # in the middle) instead of the edges.
+    scene = {"background": {"type": "solid", "color": [130, 130, 130]},
+             "layers": [{"ops": [{"op": "vignette", "strength": 200}]}]}
+    with tempfile.TemporaryDirectory() as d:
+        res = renderer.render_json(scene, filename="vig.png", width=256, height=256, _output_dir=d)
+        im = Image.open(res["png"]).convert("L")
+        assert im.getpixel((4, 4)) < im.getpixel((128, 128)), "edge should be darker than center"
+        assert im.getpixel((128, 128)) >= 120, "center should stay near the base tone"
 
 
 def test_render_json_accepts_a_string():

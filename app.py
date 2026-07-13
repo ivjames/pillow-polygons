@@ -168,11 +168,12 @@ Rules:
 - After every alpha_composite, re-acquire draw:
     img = Image.alpha_composite(img.convert("RGBA"), layer).convert("RGB")
     draw = ImageDraw.Draw(img)
-- Always end with a vignette:
+- Always end with a vignette that darkens the EDGES and fades to clear at the
+  CENTER (alpha highest on the outer ring, 0 in the middle):
     vig = Image.new("RGBA",(W,H),(0,0,0,0))
     vd = ImageDraw.Draw(vig)
     for r in range(0,min(W,H)//2,10):
-        a = int(85*(r/(min(W,H)//2)))
+        a = int(85*(1 - r/(min(W,H)//2)))
         vd.rectangle([r,r,W-r,H-r], outline=(0,0,0,a), width=10)
     img = Image.alpha_composite(img.convert("RGBA"),vig).convert("RGB")
     draw = ImageDraw.Draw(img)
