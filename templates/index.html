@@ -41,21 +41,6 @@
           </select>
         </div>
 
-                <div class="field">
-          <label>Preset palette</label>
-          <div class="preset-grid">
-            {% for p in presets %}
-            <div class="preset-item">
-              <button type="button" class="preset-btn{% if p.name == '' %} active{% endif %}" data-preset="{{ p.name }}">
-                <span class="preset-swatch" style="background: {{ p.swatch }}"></span>{{ p.label }}
-              </button>
-              <button type="button" class="preset-info" aria-label="About {{ p.label }} preset" aria-expanded="false">i</button>
-              <div class="preset-pop" role="tooltip">{{ p.description }}</div>
-            </div>
-            {% endfor %}
-          </div>
-        </div>
-
         <div class="field row">
           <div class="half">
             <label>Width px</label>
