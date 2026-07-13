@@ -23,7 +23,7 @@ VALID = {
     "layers": [
         {"ops": [
             {"op": "ellipse", "bbox": [50, 50, 200, 200], "fill": [200, 180, 90], "outline": [255, 255, 255], "width": 3},
-            {"op": "polygon", "points": [[60, 60], [180, 70], [120, 190]], "fill": "accent"},
+            {"op": "polygon", "points": [[60, 60], [180, 70], [120, 190]], "fill": [200, 180, 90]},
             {"op": "line", "points": [[0, 0], [256, 256]], "fill": [255, 0, 0], "width": 2},
             {"op": "arc", "bbox": [20, 20, 120, 120], "start": 0, "end": 180, "fill": [0, 255, 0]},
             {"op": "text", "xy": [10, 10], "text": "hi", "fill": [255, 255, 255], "size": 18},
@@ -112,7 +112,7 @@ VECTOR = {
             {"op": "scatter", "count": 120, "area": [0, 0, 256, 90],
              "shape": {"op": "ellipse", "bbox": [-1, -1, 1, 1], "fill": [255, 255, 255]}},
             {"op": "repeat", "nx": 6, "ny": 2, "dx": 40, "dy": 30, "x0": 20, "y0": 200,
-             "shape": {"op": "polygon", "points": [[0, 0], [16, 0], [8, 14]], "fill": "accent"}},
+             "shape": {"op": "polygon", "points": [[0, 0], [16, 0], [8, 14]], "fill": [200, 180, 90]}},
         ]},
     ],
 }

@@ -22,13 +22,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from renderer import validate_scene, render, SceneValidationError  # noqa: E402
 
 BENIGN = """
-img = Image.new("RGB", (W, H), palette.get('bg', (20, 20, 30)))
+img = Image.new("RGB", (W, H), (20, 20, 30))
 draw = ImageDraw.Draw(img)
 for i in range(8):
     x = rng.randint(0, W)
     y = rng.randint(0, H)
     r = rng.randint(10, 60)
-    draw.ellipse([x - r, y - r, x + r, y + r], fill=palette.get('accent', (200, 200, 255)))
+    draw.ellipse([x - r, y - r, x + r, y + r], fill=(200, 200, 255))
 draw.polygon([(10, 10), (W - 10, 20), (W // 2, H - 10)], outline=(255, 255, 255))
 """
 

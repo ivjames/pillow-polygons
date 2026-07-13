@@ -27,7 +27,7 @@ def _stub_call_claude(responses):
     records how many times it was invoked."""
     state = {"i": 0, "n": 0}
 
-    def fake(prompt, preset, seed, model, system=None, max_tokens=app.MAX_OUTPUT_TOKENS):
+    def fake(prompt, seed, model, system=None, max_tokens=app.MAX_OUTPUT_TOKENS):
         state["n"] += 1
         resp = responses[min(state["i"], len(responses) - 1)]
         state["i"] += 1
@@ -42,7 +42,7 @@ def test_python_truncation_reports_honestly_and_retries_once(monkeypatch):
     monkeypatch.setattr(app, "call_claude", fake)
 
     try:
-        app._generate_python_scene("a dragon", None, 42, "claude-sonnet-4-6")
+        app._generate_python_scene("a dragon", 42, "claude-sonnet-4-6")
         assert False, "expected SceneGenError on persistent truncation"
     except app.SceneGenError as e:
         assert "output length limit" in e.message      # not a "syntax error"
@@ -58,7 +58,7 @@ def test_python_truncation_recovers_on_retry(monkeypatch):
     ])
     monkeypatch.setattr(app, "call_claude", fake)
 
-    code, tin, tout = app._generate_python_scene("a cat", None, 42, "claude-sonnet-4-6")
+    code, tin, tout = app._generate_python_scene("a cat", 42, "claude-sonnet-4-6")
     assert code == complete
     assert (tin, tout) == (20, 60)                      # tokens accumulate across calls
     assert state["n"] == 2
@@ -69,7 +69,7 @@ def test_json_truncation_reports_honestly_and_retries_once(monkeypatch):
     monkeypatch.setattr(app, "call_claude", fake)
 
     try:
-        app._generate_json_scene("a dragon", None, 42, "claude-sonnet-4-6")
+        app._generate_json_scene("a dragon", 42, "claude-sonnet-4-6")
         assert False, "expected SceneGenError on persistent truncation"
     except app.SceneGenError as e:
         assert "output length limit" in e.message
