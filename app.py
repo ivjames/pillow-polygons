@@ -456,21 +456,44 @@ def _scene_text(payload):
     return json.dumps(payload)
 
 
-def row_to_dict(row, include_scene=True):
+def _names_by_image(db, ids, join_sql, id_col):
+    """Group one relation (tags or folders) for a set of image ids into
+    {image_id: [name, ...]} with a handful of queries instead of one per image
+    (the old N+1). `join_sql` must select `image_id AS iid, name`; we append the
+    IN filter on `id_col`. ids are chunked so a large unbounded gallery never
+    exceeds SQLite's bound-variable ceiling."""
+    out = {}
+    CHUNK = 500
+    for i in range(0, len(ids), CHUNK):
+        chunk = ids[i:i + CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        for r in db.execute(f"{join_sql} WHERE {id_col} IN ({placeholders})", chunk).fetchall():
+            out.setdefault(r["iid"], []).append(r["name"])
+    return out
+
+
+def row_to_dict(row, include_scene=True, tags=None, folders=None):
     d = dict(row)
     # scene_code is the full generated source (multi-KB per Python scene) and the
     # client never reads it — the gallery list drops it to keep the list response
     # small. The single-image generate response keeps it (include_scene=True).
     if not include_scene:
         d.pop("scene_code", None)
-    db = get_db()
     img_id = d["id"]
-    d["tags"] = [r["name"] for r in db.execute(
-        "SELECT t.name FROM tags t JOIN image_tags it ON t.id=it.tag_id WHERE it.image_id=?", (img_id,)
-    ).fetchall()]
-    d["folders"] = [r["name"] for r in db.execute(
-        "SELECT f.name FROM folders f JOIN image_folders if2 ON f.id=if2.folder_id WHERE if2.image_id=?", (img_id,)
-    ).fetchall()]
+    # tags/folders can be supplied by the batch (list) path to avoid a per-row
+    # query; when omitted (single-image path) fetch them individually.
+    if tags is None or folders is None:
+        db = get_db()
+    if tags is None:
+        tags = [r["name"] for r in db.execute(
+            "SELECT t.name FROM tags t JOIN image_tags it ON t.id=it.tag_id WHERE it.image_id=?", (img_id,)
+        ).fetchall()]
+    if folders is None:
+        folders = [r["name"] for r in db.execute(
+            "SELECT f.name FROM folders f JOIN image_folders if2 ON f.id=if2.folder_id WHERE if2.image_id=?", (img_id,)
+        ).fetchall()]
+    d["tags"] = tags
+    d["folders"] = folders
     # Derived, not stored: USD cost from the model + token counts (works for old
     # rows too — a NULL model just prices at the default tier).
     d["cost_usd"] = compute_cost(d.get("model"), d.get("tokens_in"), d.get("tokens_out"))
@@ -613,9 +636,24 @@ def list_images():
         sql += " LIMIT ? OFFSET ?"; params += [lim, off]
 
     rows = db.execute(sql, params).fetchall()
+
+    # Batch the tag/folder lookups for the whole page: a couple of grouped queries
+    # instead of two per row (the old N+1). Each row then gets its lists handed in.
+    ids = [r["id"] for r in rows]
+    tags_by_id = _names_by_image(
+        db, ids,
+        "SELECT it.image_id AS iid, t.name AS name FROM tags t JOIN image_tags it ON t.id=it.tag_id",
+        "it.image_id")
+    folders_by_id = _names_by_image(
+        db, ids,
+        "SELECT if2.image_id AS iid, f.name AS name FROM folders f JOIN image_folders if2 ON f.id=if2.folder_id",
+        "if2.image_id")
+
     # include_scene=False drops the unused scene_code column from every row —
     # the bulk of the old list payload.
-    return jsonify([{**row_to_dict(r, include_scene=False),
+    return jsonify([{**row_to_dict(r, include_scene=False,
+                                   tags=tags_by_id.get(r["id"], []),
+                                   folders=folders_by_id.get(r["id"], [])),
                      "url": f"/static/renders/{r['filename']}",
                      "thumb_url": f"/static/renders/{r['thumb']}"} for r in rows])
 
