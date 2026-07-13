@@ -44,11 +44,15 @@
                 <div class="field">
           <label>Preset palette</label>
           <div class="preset-grid">
-            <button class="preset-btn active" data-preset="">None</button>
-            <button class="preset-btn" data-preset="night">Night</button>
-            <button class="preset-btn" data-preset="golden">Golden</button>
-            <button class="preset-btn" data-preset="swamp">Swamp</button>
-            <button class="preset-btn" data-preset="bone">Bone</button>
+            {% for p in presets %}
+            <div class="preset-item">
+              <button type="button" class="preset-btn{% if p.name == '' %} active{% endif %}" data-preset="{{ p.name }}">
+                <span class="preset-swatch" style="background: {{ p.swatch }}"></span>{{ p.label }}
+              </button>
+              <button type="button" class="preset-info" aria-label="About {{ p.label }} preset" aria-expanded="false">i</button>
+              <div class="preset-pop" role="tooltip">{{ p.description }}</div>
+            </div>
+            {% endfor %}
           </div>
         </div>
 
