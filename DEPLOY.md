@@ -1,11 +1,92 @@
 # Deploying Pillow Polygons
 
-A hardened, two-container setup for running the app on a portfolio site. It
-layers **network isolation** and **container** isolation on top of the
-**application-level** scene-code sandbox in the code (AST allowlist + restricted
-builtins + subprocess rlimits — see the README "Security" section).
+There are two supported ways to run this app, differing **only** in how much
+they isolate the step that executes model-generated scene code:
 
-## Architecture — the render path has no network
+- **Single process under pm2 (`RENDER_MODE=local`)** — how it runs on the
+  lab980 droplet today. One Flask process; scene code executes in an in-process
+  **subprocess sandbox** (AST allowlist + restricted builtins + subprocess
+  rlimits). No Docker. Simplest to operate.
+- **Two containers under Docker (`RENDER_MODE=worker`)** — the hardened setup.
+  Scene code runs only in a separate, **network-less** worker container
+  (`network_mode: none` + seccomp), so a sandbox escape has no network and no
+  API key. Stronger isolation; needs Docker.
+
+Both share the same application-level sandbox in the code (see the README
+"Security" section). What differs is the render path's blast radius if that
+sandbox is ever escaped — see the isolation notes below.
+
+---
+
+## How it runs on lab980 (pm2, no Docker)
+
+Deployed at `/var/www/poly`, run by pm2 as **`poly-app`**: `python3 app.py`,
+listening on `127.0.0.1:8040` behind an nginx TLS proxy. `RENDER_MODE` is unset,
+so it uses the default `local` (the in-process subprocess sandbox).
+
+### Deploy / redeploy
+
+```bash
+cd /var/www/poly
+git pull
+python3 -m venv .venv && . .venv/bin/activate    # first time only
+pip install -r requirements.txt
+# .env holds ANTHROPIC_API_KEY (the app loads it); the app listens on 8040
+pm2 restart poly-app
+# first time instead:
+#   pm2 start app.py --name poly-app --interpreter python3
+pm2 save                     # snapshot the current process list to the dump
+```
+
+**One time per droplet — install pm2's boot hook, or `poly-app` won't come back
+after a reboot.** `pm2 save` only writes the dump; without the systemd hook
+nothing replays it at boot.
+
+```bash
+pm2 startup systemd -u root --hp /root   # run the sudo command it prints, once
+systemctl is-enabled pm2-root            # verify -> should print `enabled`
+```
+
+Verify:
+
+```bash
+curl -s http://127.0.0.1:8040/api/tags   # -> [] (200)
+pm2 logs poly-app --lines 50
+```
+
+> **Isolation in `local` mode.** Scene code runs in a subprocess behind the AST
+> allowlist and rlimits, but that subprocess shares this process's network
+> namespace — so a hypothetical sandbox escape *could* reach the network and the
+> Anthropic API key. That residual gap is the whole reason the `worker` mode
+> below exists. `local` is a reasonable trade-off for a single-user portfolio
+> deploy; if you need the network-less guarantee, run the Docker worker setup.
+
+> **Heads up: `deploy.sh` is stale.** It writes an older `app.py` to
+> `/var/www/poly` via heredoc that predates the `RENDER_MODE`/`SCENE_FORMAT`
+> sandbox split. Deploy with `git pull` + `pm2 restart` as above — don't run
+> `deploy.sh`.
+
+### nginx TLS proxy
+
+A certbot-managed vhost proxies the subdomain to the local port:
+
+```
+server_name poly.lab980.com;
+location / { proxy_pass http://127.0.0.1:8040; }
+```
+
+Set `TRUST_PROXY=1` so the per-IP rate limits read the real client IP from
+`X-Forwarded-For` instead of the proxy's address.
+
+---
+
+## Hardened alternative: the network-less worker (Docker, `RENDER_MODE=worker`)
+
+A two-container setup that layers **network isolation** and **container**
+isolation on top of the application-level scene-code sandbox. Not what the
+droplet runs today, but the stronger posture if this ever took real traffic.
+
+### Architecture — the render path has no network
 
 ```
             ┌─────────────────┐   shared volume    ┌──────────────────────────┐
@@ -24,7 +105,7 @@ waits. `render` runs with `network_mode: none` — no network stack at all — s
 even a sandbox escape in CPython/Pillow has nowhere to phone home, no access to
 the web tier, and no API key. See `jobqueue.py` / `render_worker.py`.
 
-## Quick start
+### Quick start
 
 ```bash
 cp .env.example .env          # add your ANTHROPIC_API_KEY
@@ -40,7 +121,7 @@ docker compose ps                              # web + render both up
 docker compose logs -f render                  # "render_worker: watching ..."
 ```
 
-## What the container hardening adds
+### What the container hardening adds
 
 | Control | web | render | Why |
 |---|:--:|:--:|---|
@@ -60,12 +141,6 @@ shared renders volume; an `import os` injection is rejected; and `socket()`
 inside `render` fails with `PermissionError` (seccomp) on top of having no
 network interfaces.
 
-### Render mode
-
-`RENDER_MODE=worker` (set for `web` in compose) routes renders through the queue.
-The default, `RENDER_MODE=local`, runs the in-process subprocess sandbox instead
-— handy for `python app.py` development and the test suite, with no worker needed.
-
 ### seccomp portability
 
 `seccomp/render-worker.json` is a deny-by-default allowlist curated and verified
@@ -75,7 +150,7 @@ worker for the `EPERM` syscall and add it — or drop the `seccomp:...` line fro
 the `render` service to fall back to `--network none` + Docker's default seccomp,
 which still fully isolates the render path from the network.
 
-## Reverse proxy + real client IPs
+### Reverse proxy + real client IPs
 
 The container publishes to `127.0.0.1` only. Terminate TLS with a proxy
 (Caddy/nginx/Traefik) in front, and set `TRUST_PROXY=1` (already set in compose)
@@ -88,20 +163,7 @@ polygons.example.com {
 }
 ```
 
-## Environment variables
-
-`ANTHROPIC_API_KEY` is required (via `.env`). All anti-abuse and sandbox knobs
-are documented in the README; the deployment-relevant additions are:
-
-| Var | Default | Meaning |
-|-----|---------|---------|
-| `POLY_DB_PATH` | `<app>/poly.db` | SQLite location — pointed at the `/data` volume so the rootfs can stay read-only. |
-| `RENDER_CPU_SECONDS` / `RENDER_MEM_MB` / `RENDER_WALL_SECONDS` / `RENDER_FSIZE_MB` | `10` / `1024` / `20` / `64` | Per-render subprocess limits. |
-| `RENDER_CONCURRENCY` | `1` | Max simultaneous render subprocesses in the worker (see memory budget below). |
-| `RENDER_MODE` | `local` | `worker` routes renders to the network-less worker (compose sets this on `web`); `local` runs the in-process sandbox. |
-| `SCENE_FORMAT` | `python` | `json` makes the model emit a declarative JSON scene drawn by a fixed interpreter (no code execution; see the README "Scene format" section). `python` is the default exec'd-scene-code path. |
-| `JOBS_DIR` | `/jobs` | Shared job-queue directory (mounted into both `web` and `render`). |
-| `RENDER_QUEUE_MAX_WAIT` | `300` | Absolute backstop (seconds) the web tier waits for a queued render before giving up. A job only counts against the per-render budget once the worker *starts* it; queue wait is bounded by this instead. |
+### Memory & scaling
 
 > **Memory budget — keep these consistent.** Renders run in the `render`
 > container, serialized by `RENDER_CONCURRENCY` (default 1), so the worst-case
@@ -117,13 +179,30 @@ are documented in the README; the deployment-relevant additions are:
 > web workers/replicas needs a shared store (Redis); see the README. The `render`
 > worker can be scaled independently (each instance claims jobs atomically).
 
-## Network/syscall isolation of the render path (issue #2 — done)
+---
 
-Scene code now executes **only** in the `render` service, which runs with
-`network_mode: none` and the deny-by-default seccomp profile in
+## Environment variables
+
+`ANTHROPIC_API_KEY` is required (via `.env`). All anti-abuse and sandbox knobs
+are documented in the README; the deployment-relevant additions are:
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `POLY_DB_PATH` | `<app>/poly.db` | SQLite location — pointed at the `/data` volume so the rootfs can stay read-only. |
+| `RENDER_CPU_SECONDS` / `RENDER_MEM_MB` / `RENDER_WALL_SECONDS` / `RENDER_FSIZE_MB` | `10` / `1024` / `20` / `64` | Per-render subprocess limits. |
+| `RENDER_CONCURRENCY` | `1` | Max simultaneous render subprocesses in the worker (see memory budget above). |
+| `RENDER_MODE` | `local` | `worker` routes renders to the network-less worker (compose sets this on `web`); `local` runs the in-process sandbox (the lab980 default). |
+| `SCENE_FORMAT` | `python` | `json` makes the model emit a declarative JSON scene drawn by a fixed interpreter (no code execution; see the README "Scene format" section). `python` is the default exec'd-scene-code path. |
+| `JOBS_DIR` | `/jobs` | Shared job-queue directory (mounted into both `web` and `render`) — worker mode only. |
+| `RENDER_QUEUE_MAX_WAIT` | `300` | Absolute backstop (seconds) the web tier waits for a queued render before giving up. A job only counts against the per-render budget once the worker *starts* it; queue wait is bounded by this instead. |
+
+## Network/syscall isolation of the render path (issue #2)
+
+In `worker` mode, scene code executes **only** in the `render` service, which
+runs with `network_mode: none` and the deny-by-default seccomp profile in
 [`seccomp/render-worker.json`](seccomp/render-worker.json) (networking syscalls
 omitted). The web tier never `exec()`s scene code; it hands jobs over the shared
-`/jobs` queue and waits. This closes the residual gap from the earlier
-single-container setup, where the render subprocess inherited the web container's
-network namespace. See the architecture diagram above and the seccomp portability
-note for tuning on other kernels/arches.
+`/jobs` queue and waits. This closes the residual gap present in `local` mode,
+where the render subprocess inherits the web process's network namespace. See
+the architecture diagram above and the seccomp portability note for tuning on
+other kernels/arches.
