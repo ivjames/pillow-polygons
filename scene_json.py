@@ -39,8 +39,7 @@ Schema (see SYSTEM_PROMPT_JSON in app.py for the model-facing description):
       ]
     }
 
-<color> is [r,g,b] or [r,g,b,a] (0-255) or one of the palette keys
-"bg"/"atmosphere"/"accent". All primitives have a vector SVG representation, so
+<color> is [r,g,b] or [r,g,b,a] (0-255). All primitives have a vector SVG representation, so
 the SVG twin stays faithful.
 """
 
@@ -67,9 +66,6 @@ LEAF_OPS = frozenset({
 })
 # Everything the schema accepts (leaf primitives + the expanding/effect ops).
 ALLOWED_OPS = LEAF_OPS | frozenset({"grain", "vignette", "scatter", "repeat"})
-
-# Palette keys whose values are colors (palette["grain"] is a count, not a color).
-_PALETTE_COLOR_KEYS = ("bg", "atmosphere", "accent")
 
 # Font candidates (mirrors the Python path; falls back to Pillow's default).
 _FONT_PATHS = (
@@ -228,11 +224,9 @@ def _width(op, default=1):
     return max(1, int(_num(op.get("width", default), default)))
 
 
-def _color(c, palette, default=None):
-    """Resolve a color: an [r,g,b(,a)] list, a palette key string, or default."""
-    if isinstance(c, str):
-        v = palette.get(c) if c in _PALETTE_COLOR_KEYS else None
-        c = v
+def _color(c, default=None):
+    """Resolve a color: an [r,g,b(,a)] list, else the default. (Palette-key color
+    strings were removed with the theme system.)"""
     if isinstance(c, (list, tuple)) and 3 <= len(c) <= 4:
         return tuple(int(max(0, min(255, _num(x)))) for x in c)
     return default
@@ -259,15 +253,15 @@ def _font(size):
 
 
 # ── per-op drawing ───────────────────────────────────────────────────────────
-def _draw_op(op, draw, svg, palette, W, H, rng):
+def _draw_op(op, draw, svg, W, H, rng):
     name = op.get("op")
 
     if name == "polygon":
         pts = _points(op)
         if len(pts) < 2:
             return
-        fill = _color(op.get("fill"), palette)
-        outline = _color(op.get("outline"), palette)
+        fill = _color(op.get("fill"))
+        outline = _color(op.get("outline"))
         w = _width(op)
         draw.polygon(pts, fill=fill, outline=outline)
         if outline and w > 1:                       # polygon() ignores width pre-Pillow 9.1
@@ -277,8 +271,8 @@ def _draw_op(op, draw, svg, palette, W, H, rng):
 
     elif name == "ellipse":
         bb = _bbox(op)
-        fill = _color(op.get("fill"), palette)
-        outline = _color(op.get("outline"), palette)
+        fill = _color(op.get("fill"))
+        outline = _color(op.get("outline"))
         w = _width(op)
         draw.ellipse(bb, fill=fill, outline=outline, width=w)
         if svg is not None:
@@ -286,8 +280,8 @@ def _draw_op(op, draw, svg, palette, W, H, rng):
 
     elif name == "rectangle":
         bb = _bbox(op)
-        fill = _color(op.get("fill"), palette)
-        outline = _color(op.get("outline"), palette)
+        fill = _color(op.get("fill"))
+        outline = _color(op.get("outline"))
         w = _width(op)
         draw.rectangle(bb, fill=fill, outline=outline, width=w)
         if svg is not None:
@@ -297,7 +291,7 @@ def _draw_op(op, draw, svg, palette, W, H, rng):
         pts = _points(op)
         if len(pts) < 2:
             return
-        fill = _color(op.get("fill"), palette, default=(255, 255, 255))
+        fill = _color(op.get("fill"), default=(255, 255, 255))
         w = _width(op)
         draw.line(pts, fill=fill, width=w)
         if svg is not None:
@@ -307,7 +301,7 @@ def _draw_op(op, draw, svg, palette, W, H, rng):
         bb = _bbox(op)
         start = _num(op.get("start", 0))
         end = _num(op.get("end", 360))
-        fill = _color(op.get("fill"), palette, default=(255, 255, 255))
+        fill = _color(op.get("fill"), default=(255, 255, 255))
         w = _width(op)
         draw.arc(bb, start=start, end=end, fill=fill, width=w)
         if svg is not None:
@@ -315,7 +309,7 @@ def _draw_op(op, draw, svg, palette, W, H, rng):
 
     elif name == "point":
         pts = _points(op)
-        fill = _color(op.get("fill"), palette, default=(255, 255, 255))
+        fill = _color(op.get("fill"), default=(255, 255, 255))
         for xy in pts:
             draw.point(xy, fill=fill)
         if svg is not None:
@@ -324,37 +318,37 @@ def _draw_op(op, draw, svg, palette, W, H, rng):
     elif name == "text":
         xy = _ipt(op.get("xy", [0, 0]))
         text = str(op.get("text", ""))[:MAX_TEXT]
-        fill = _color(op.get("fill"), palette, default=(255, 255, 255))
+        fill = _color(op.get("fill"), default=(255, 255, 255))
         font = _font(op.get("size", 14))
         draw.text(xy, text, fill=fill, font=font)
         if svg is not None:
             svg.text(xy, text, fill=fill, font=font)
 
     elif name == "bezier":
-        _bezier(op, draw, svg, palette)
+        _bezier(op, draw, svg)
 
     elif name == "grain":
-        _grain(op, draw, palette, W, H, rng)
+        _grain(op, draw, W, H, rng)
 
     elif name == "vignette":
         _vignette(draw, W, H, op.get("strength", 85))
 
     elif name == "scatter":
-        _scatter(op, draw, svg, palette, W, H, rng)
+        _scatter(op, draw, svg, W, H, rng)
 
     elif name == "repeat":
-        _repeat(op, draw, svg, palette, W, H, rng)
+        _repeat(op, draw, svg, W, H, rng)
 
 
-def _bezier(op, draw, svg, palette):
+def _bezier(op, draw, svg):
     """A quadratic (3 control points) or cubic (4) bezier. Sampled to a polyline
     for the PNG; emitted as a true vector <path> in the SVG twin. Token-cheap —
     a smooth curve from 3-4 points instead of an enumerated polyline."""
     ctrl = _points(op)
     if len(ctrl) not in (3, 4):
         return
-    stroke = _color(op.get("stroke"), palette, default=(255, 255, 255))
-    fill = _color(op.get("fill"), palette)
+    stroke = _color(op.get("stroke"), default=(255, 255, 255))
+    fill = _color(op.get("fill"))
     w = _width(op)
     closed = bool(op.get("closed"))
 
@@ -405,7 +399,7 @@ def _translate_op(op, dx, dy):
     return out
 
 
-def _scatter(op, draw, svg, palette, W, H, rng):
+def _scatter(op, draw, svg, W, H, rng):
     """Stamp `count` copies of a template `shape` at random offsets within `area`
     (default: the whole canvas). One compact op -> many vector shapes."""
     shape = op.get("shape")
@@ -422,10 +416,10 @@ def _scatter(op, draw, svg, palette, W, H, rng):
     for _ in range(count):
         dx = rng.randint(lo_x, hi_x) if hi_x > lo_x else lo_x
         dy = rng.randint(lo_y, hi_y) if hi_y > lo_y else lo_y
-        _draw_op(_translate_op(shape, dx, dy), draw, svg, palette, W, H, rng)
+        _draw_op(_translate_op(shape, dx, dy), draw, svg, W, H, rng)
 
 
-def _repeat(op, draw, svg, palette, W, H, rng):
+def _repeat(op, draw, svg, W, H, rng):
     """Stamp a template `shape` across an nx×ny grid stepping by (dx, dy) from
     (x0, y0). One compact op -> a tiled field of vector shapes."""
     shape = op.get("shape")
@@ -442,12 +436,12 @@ def _repeat(op, draw, svg, palette, W, H, rng):
     for j in range(ny):
         for i in range(nx):
             _draw_op(_translate_op(shape, x0 + i * dx, y0 + j * dy),
-                     draw, svg, palette, W, H, rng)
+                     draw, svg, W, H, rng)
 
 
-def _grain(op, draw, palette, W, H, rng):
+def _grain(op, draw, W, H, rng):
     count = max(0, min(MAX_GRAIN, int(_num(op.get("count", 1000), 1000))))
-    col = _color(op.get("fill"), palette, default=(255, 255, 255))
+    col = _color(op.get("fill"), default=(255, 255, 255))
     a = int(max(0, min(255, _num(op.get("alpha", 40), 40))))
     if len(col) == 3:
         col = (col[0], col[1], col[2], a)
@@ -465,11 +459,11 @@ def _vignette(draw, W, H, strength):
         draw.rectangle([r, r, W - r, H - r], outline=(0, 0, 0, a), width=10)
 
 
-def _paint_background(bg, img, svg, palette, W, H):
+def _paint_background(bg, img, svg, W, H):
     t = bg.get("type")
     if t == "gradient":
-        c0 = _color(bg.get("from"), palette, default=(10, 10, 20))
-        c1 = _color(bg.get("to"), palette, default=(30, 30, 50))
+        c0 = _color(bg.get("from"), default=(10, 10, 20))
+        c1 = _color(bg.get("to"), default=(30, 30, 50))
         horizontal = bg.get("direction") == "horizontal"
         d = ImageDraw.Draw(img)
         n = (W if horizontal else H) or 1
@@ -485,8 +479,8 @@ def _paint_background(bg, img, svg, palette, W, H):
         if svg is not None:
             svg.linear_gradient_bg(c0, c1, horizontal)
     elif t == "radial":
-        inner = _color(bg.get("inner"), palette, default=(60, 60, 90))
-        outer = _color(bg.get("outer"), palette, default=(8, 8, 16))
+        inner = _color(bg.get("inner"), default=(60, 60, 90))
+        outer = _color(bg.get("outer"), default=(8, 8, 16))
         cx = int(_num(bg.get("cx", W / 2)))
         cy = int(_num(bg.get("cy", H / 2)))
         r = int(_num(bg.get("r", max(W, H) / 2))) or 1
@@ -503,19 +497,19 @@ def _paint_background(bg, img, svg, palette, W, H):
         if svg is not None:
             svg.radial_gradient_bg(inner, outer, cx, cy, r)
     elif t == "solid":
-        c = _color(bg.get("color"), palette, default=(0, 0, 0))
+        c = _color(bg.get("color"), default=(0, 0, 0))
         ImageDraw.Draw(img).rectangle([0, 0, W, H], fill=c[:3])
         if svg is not None:
             svg.rectangle([0, 0, W, H], fill=c[:3])
-    # else: leave the canvas as created (e.g. the preset background color)
+    # else: leave the canvas as created (its solid fill color)
 
 
 # ── entry point ──────────────────────────────────────────────────────────────
-def paint(scene, *, img, draw, svg, W, H, rng, palette):
+def paint(scene, *, img, draw, svg, W, H, rng):
     """Draw a validated JSON scene onto `img`. Returns the final image (layer
     compositing replaces it). A single malformed op is skipped, not fatal —
     mirroring the way one bad draw call wouldn't abort the Python path."""
-    _paint_background(scene.get("background") or {}, img, svg, palette, W, H)
+    _paint_background(scene.get("background") or {}, img, svg, W, H)
 
     for layer in scene.get("layers", []):
         ops = layer.get("ops", []) or []
@@ -524,7 +518,7 @@ def paint(scene, *, img, draw, svg, W, H, rng, palette):
         svg_start = svg.mark() if svg is not None else 0
         for op in ops:
             try:
-                _draw_op(op, odraw, svg, palette, W, H, rng)
+                _draw_op(op, odraw, svg, W, H, rng)
             except Exception:
                 continue   # one bad op shouldn't kill the whole render
         a = int(max(0, min(255, _num(layer.get("alpha", 255), 255))))

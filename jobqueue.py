@@ -89,7 +89,7 @@ def _quiet_remove(path):
 
 
 def submit_and_wait(scene_code, *, filename, width, height, seed,
-                    ref=None, preset=None, thumbnail=True, output_dir=None,
+                    ref=None, thumbnail=True, output_dir=None,
                     scene_format="python"):
     """Hand a render job to the worker and block for its result.
 
@@ -109,7 +109,7 @@ def submit_and_wait(scene_code, *, filename, width, height, seed,
 
     spec = {
         "id": job_id, "scene_code": scene_code, "filename": filename,
-        "width": width, "height": height, "seed": seed, "preset": preset,
+        "width": width, "height": height, "seed": seed,
         "thumbnail": thumbnail, "ref": ref_name, "output_dir": output_dir,
         "scene_format": scene_format,
     }

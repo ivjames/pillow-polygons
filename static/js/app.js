@@ -3,7 +3,6 @@ let activeImage  = null;   // current image object
 let activeFolder = "";
 let activeTag    = "";
 let searchQ      = "";
-let selectedPreset = "";
 
 /* ── DOM refs ── */
 const $ = id => document.getElementById(id);
@@ -35,9 +34,6 @@ const folderBar    = $("folder-bar");
 const tagBar       = $("tag-bar");
 const newFolderInput = $("new-folder-input");
 const createFolderBtn = $("create-folder-btn");
-
-/* Preset picker removed from the UI — generation always runs with no preset
-   (selectedPreset stays ""). Backend palette code is left intact for restoration. */
 
 /* ── Seed random ── */
 $("random-seed").addEventListener("click", () => {
@@ -76,7 +72,6 @@ async function generate() {
 
   const fd = new FormData();
   fd.append("prompt", p);
-  fd.append("preset", selectedPreset);
   fd.append("model",  $("model-select").value);
   fd.append("seed",   seedInput.value);
   fd.append("width",  widthInput.value);

@@ -50,7 +50,7 @@ def _result_for(spec):
             spec["scene_code"],
             filename=spec["filename"],
             width=spec["width"], height=spec["height"], seed=spec["seed"],
-            ref=ref, preset=spec.get("preset"), scene_format=scene_format,
+            ref=ref, scene_format=scene_format,
             thumbnail=spec.get("thumbnail", True),
             _output_dir=spec.get("output_dir") or RENDERS_DIR,
         )

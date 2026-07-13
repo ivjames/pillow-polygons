@@ -108,41 +108,6 @@ def validate_scene(code):
                 return f"use of '{node.id}' is not allowed"
     return None
 
-# One source of truth for presets: palette colors PLUS the human-facing label and
-# an honest, literal description of what the theme does to the sky. The UI renders
-# its buttons and popovers from this list (so they can't drift from the renderer),
-# and PRESETS below — colors only, what the renderer/palette consumes — is derived
-# from it. Descriptions state brightness plainly (e.g. golden is dusk, not midday)
-# so the picker doesn't let users assume the wrong thing.
-_PALETTE_KEYS = ("bg", "atmosphere", "accent", "grain")
-PRESET_INFO = [
-    {"name": "night",  "label": "Night",
-     "description": "Deep near-black night in cool blues — starlit, low-light mood.",
-     "bg": (8,10,22),    "atmosphere": (15,20,45,60),   "accent": (180,210,255), "grain": 3000},
-    {"name": "golden", "label": "Golden",
-     "description": "Warm golden-hour dusk: a dark amber sky. Not a bright daytime look.",
-     "bg": (38,28,12),   "atmosphere": (80,55,20,50),   "accent": (240,195,80),  "grain": 2000},
-    {"name": "swamp",  "label": "Swamp",
-     "description": "Murky low-light bog — muted greens, dim and moody.",
-     "bg": (8,18,12),    "atmosphere": (20,50,28,55),   "accent": (70,160,90),   "grain": 2500},
-    {"name": "bone",   "label": "Bone",
-     "description": "Pale bleached daylight — a light off-white / tan background.",
-     "bg": (210,200,185),"atmosphere": (180,168,148,40),"accent": (90,70,50),    "grain": 1500},
-    {"name": "day",    "label": "Day",
-     "description": "Bright blue midday sky, light and airy — the sunny-day look.",
-     "bg": (206,231,250),"atmosphere": (120,175,235,50),"accent": (255,224,130), "grain": 700},
-    {"name": "dawn",   "label": "Dawn",
-     "description": "Soft sunrise — peach horizon fading to light periwinkle. Warm and gentle.",
-     "bg": (255,206,178),"atmosphere": (150,140,200,55),"accent": (255,168,120), "grain": 1200},
-    {"name": "storm",  "label": "Storm",
-     "description": "Grey overcast — flat, muted, low-contrast slate.",
-     "bg": (120,126,136),"atmosphere": (86,92,102,60),  "accent": (206,212,222), "grain": 2200},
-    {"name": "neon",   "label": "Neon",
-     "description": "Saturated retro glow — violet-to-magenta sky with a cyan accent.",
-     "bg": (232,48,150), "atmosphere": (70,18,110,60),  "accent": (72,232,226),  "grain": 1200},
-]
-PRESETS = {p["name"]: {k: p[k] for k in _PALETTE_KEYS} for p in PRESET_INFO}
-
 
 class SVGRecorder:
     """
@@ -328,11 +293,8 @@ class _ImageDrawShim:
         return getattr(self._module, name)
 
 
-def _make_canvas(width, height, preset=None):
-    bg = (0,0,0)
-    if preset and preset in PRESETS:
-        bg = PRESETS[preset]["bg"]
-    img  = Image.new("RGB", (width, height), bg)
+def _make_canvas(width, height):
+    img  = Image.new("RGB", (width, height), (0, 0, 0))
     draw = ImageDraw.Draw(img)
     return img, draw
 
@@ -362,7 +324,6 @@ def render(
     height:      int   = 1024,
     seed:        int   = 42,
     ref:         Image.Image = None,
-    preset:      str   = None,
     thumbnail:   bool  = True,
     _output_dir: str   = None,
 ) -> dict:
@@ -370,15 +331,13 @@ def render(
     Render a scene. Returns dict with keys: png, svg (or None), thumb, meta.
 
     Pre-injected into scene_code:
-        img, draw, svg, W, H, rng, ref, palette,
+        img, draw, svg, W, H, rng, ref,
         Image, ImageDraw, ImageFont, math, random
     """
     W, H = width, height
-    img, draw = _make_canvas(W, H, preset)
+    img, draw = _make_canvas(W, H)
     svg_rec   = SVGRecorder(W, H)
     rng       = random.Random(seed)
-    _base_palette = {"bg": (20,20,30), "atmosphere": (30,30,50,40), "accent": (200,200,255), "grain": 2000}
-    palette   = {**_base_palette, **(PRESETS.get(preset, {}) if preset else {})}
 
     ctx = {
         # Restricted builtins: no __import__/open/eval/exec/getattr. This replaces
@@ -391,7 +350,6 @@ def render(
         "H":         H,
         "rng":       rng,
         "ref":       ref,
-        "palette":   palette,
         "Image":     Image,
         # Shim so ImageDraw.Draw(img) — which the model re-runs after every
         # alpha_composite — yields a bbox-normalizing draw, not a raw one.
@@ -412,14 +370,13 @@ def render(
         "width":       W,
         "height":      H,
         "seed":        seed,
-        "preset":      preset,
         "format":      "python",
         "layers":      len(codes),
         "rendered_at": datetime.utcnow().isoformat() + "Z",
         "scene_code":  codes,
     }
     return _write_outputs(img, svg_rec, filename=filename, out_dir=_output_dir,
-                          meta=meta, preset=preset, thumbnail=thumbnail)
+                          meta=meta, thumbnail=thumbnail)
 
 
 def render_json(
@@ -428,7 +385,6 @@ def render_json(
     width:       int   = 1024,
     height:      int   = 1024,
     seed:        int   = 42,
-    preset:      str   = None,
     thumbnail:   bool  = True,
     _output_dir: str   = None,
 ) -> dict:
@@ -451,31 +407,28 @@ def render_json(
         raise SceneValidationError(err)
 
     W, H = width, height
-    img, _ = _make_canvas(W, H, preset)
+    img, _ = _make_canvas(W, H)
     svg_rec = SVGRecorder(W, H)
     rng     = random.Random(seed)
-    _base_palette = {"bg": (20,20,30), "atmosphere": (30,30,50,40), "accent": (200,200,255), "grain": 2000}
-    palette = {**_base_palette, **(PRESETS.get(preset, {}) if preset else {})}
 
     img = scene_json.paint(scene, img=img, draw=ImageDraw.Draw(img), svg=svg_rec,
-                           W=W, H=H, rng=rng, palette=palette)
+                           W=W, H=H, rng=rng)
 
     meta = {
         "filename":    filename,
         "width":       W,
         "height":      H,
         "seed":        seed,
-        "preset":      preset,
         "format":      "json",
         "layers":      len(scene.get("layers", [])),
         "rendered_at": datetime.utcnow().isoformat() + "Z",
         "scene":       scene,
     }
     return _write_outputs(img, svg_rec, filename=filename, out_dir=_output_dir,
-                          meta=meta, preset=preset, thumbnail=thumbnail)
+                          meta=meta, thumbnail=thumbnail)
 
 
-def _write_outputs(img, svg_rec, *, filename, out_dir, meta, preset, thumbnail):
+def _write_outputs(img, svg_rec, *, filename, out_dir, meta, thumbnail):
     """Shared output stage for both render paths: PNG + JSON sidecar, an optional
     SVG twin (when the scene emitted vector primitives), and a thumbnail."""
     out_dir  = out_dir or OUTPUT_DIR
@@ -486,8 +439,7 @@ def _write_outputs(img, svg_rec, *, filename, out_dir, meta, preset, thumbnail):
 
     svg_path = None
     if svg_rec._elems:
-        bg = PRESETS[preset]["bg"] if preset and preset in PRESETS else (255,255,255)
-        svg_str  = svg_rec.to_svg(bg_color=bg)
+        svg_str  = svg_rec.to_svg(bg_color=(255, 255, 255))
         svg_name = filename.rsplit(".", 1)[0] + ".svg"
         svg_path = os.path.join(out_dir, svg_name)
         with open(svg_path, "w") as f:

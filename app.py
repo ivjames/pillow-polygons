@@ -18,7 +18,7 @@ os.makedirs(RENDERS_DIR, exist_ok=True)
 
 # inject renderer into path
 sys.path.insert(0, BASE_DIR)
-from renderer import render as poly_render, validate_scene as renderer_validate, SceneValidationError, PRESETS, PRESET_INFO
+from renderer import render as poly_render, validate_scene as renderer_validate, SceneValidationError
 import sandbox
 import jobqueue
 import scene_json
@@ -75,17 +75,17 @@ RENDER_MODE = os.environ.get("RENDER_MODE", "local").strip().lower()
 SCENE_FORMAT = os.environ.get("SCENE_FORMAT", "python").strip().lower()
 
 
-def _render_scene(scene_payload, *, filename, width, height, seed, preset):
+def _render_scene(scene_payload, *, filename, width, height, seed):
     """Dispatch a render to the worker queue or the in-process sandbox. Both
     return the renderer's dict and raise the same exceptions. The scene format
     (python/json) is taken from SCENE_FORMAT and selects the renderer path."""
     if RENDER_MODE == "worker":
         return jobqueue.submit_and_wait(
             scene_payload, filename=filename, width=width, height=height, seed=seed,
-            preset=preset, thumbnail=True, output_dir=RENDERS_DIR, scene_format=SCENE_FORMAT)
+            thumbnail=True, output_dir=RENDERS_DIR, scene_format=SCENE_FORMAT)
     return sandbox.run_scene(
         scene_payload, filename=filename, width=width, height=height, seed=seed,
-        preset=preset, thumbnail=True, _output_dir=RENDERS_DIR, scene_format=SCENE_FORMAT)
+        thumbnail=True, _output_dir=RENDERS_DIR, scene_format=SCENE_FORMAT)
 
 # ── DB ─────────────────────────────────────────────────────────────────────
 def get_db():
@@ -107,7 +107,6 @@ def init_db():
             filename    TEXT NOT NULL,
             thumb       TEXT,
             prompt      TEXT,
-            preset      TEXT,
             seed        INTEGER,
             width       INTEGER,
             height      INTEGER,
@@ -161,7 +160,7 @@ OUTPUT FORMAT — THIS IS A HARD REQUIREMENT:
 Any deviation from this format breaks the renderer.
 
 The following are pre-injected and available without importing:
-  img, draw, W, H, rng, palette,
+  img, draw, W, H, rng,
   Image, ImageDraw, ImageFont, math, random
 
 Rules:
@@ -177,17 +176,11 @@ Rules:
         vd.rectangle([r,r,W-r,H-r], outline=(0,0,0,a), width=10)
     img = Image.alpha_composite(img.convert("RGBA"),vig).convert("RGB")
     draw = ImageDraw.Draw(img)
-- Paint the background as a vertical gradient scanned line by line, built FROM the
-  palette: interpolate from palette['atmosphere'][:3] at the top to palette['bg']
-  at the bottom. The sky must take the active preset's colors — never a hardcoded
-  dark or black sky. (With no preset, palette['bg'] is a dark neutral; that's fine.)
+- Paint the background as a vertical gradient scanned line by line, choosing colors
+  that suit the scene (interpolate top→bottom for a natural sky).
 - Build characters from polygons and ellipses with shadow/base/highlight layers
 - Eyes need socket → iris → pupil → gleam
 
-Available presets inject palette dict with keys: bg, atmosphere, accent, grain
-Always use palette.get('bg', (20,20,30)) / palette.get('atmosphere', (30,30,50,40))
-style access (atmosphere is an RGBA tuple — slice [:3] for gradient fills). palette
-may be empty if no preset is selected.
 Available fonts (use try/except):
   /usr/share/fonts/truetype/google-fonts/Poppins-Light.ttf
   /usr/share/fonts/truetype/google-fonts/Poppins-Bold.ttf
@@ -208,7 +201,7 @@ Schema:
 {
   "background": {"type": "gradient", "from": [r,g,b], "to": [r,g,b], "direction": "vertical"|"horizontal"},
                  // OR {"type":"radial","inner":[r,g,b],"outer":[r,g,b],"cx":x,"cy":y,"r":n}
-                 // OR {"type":"solid","color":[r,g,b]} — omit to keep the preset background
+                 // OR {"type":"solid","color":[r,g,b]} — omit for a black background
   "layers": [
     {"alpha": 0-255,            // optional overall layer opacity, for soft glows/atmosphere
      "ops": [ <op>, ... ]}
@@ -232,8 +225,7 @@ Each <op> is exactly one of:
   {"op":"repeat","nx":a,"ny":b,"dx":px,"dy":px,"x0":px,"y0":px,"shape":<leaf op around the origin>}
                  // stamps shape across an a×b grid (e.g. windows, tiles)
 
-<color> is [r,g,b] or [r,g,b,a] (0-255), or one of the palette key strings
-"bg", "atmosphere", or "accent".
+<color> is [r,g,b] or [r,g,b,a] (0-255).
 
 BE TOKEN-EFFICIENT — this matters:
 - NEVER enumerate many near-identical shapes by hand. For repetition use "scatter"
@@ -284,30 +276,14 @@ def _strip_code_fences(text):
 MAX_OUTPUT_TOKENS = 8192
 
 
-def _palette_note(preset):
-    """Give the model the selected preset's concrete colors so it paints the sky
-    from them. Without this the model only knew the preset *name* and defaulted to
-    a near-black sky — and since 3 of the 4 presets have a near-black `bg`, every
-    theme rendered black. `atmosphere` is the light, theme-distinct tint, so steer
-    the background gradient atmosphere→bg. Empty string when no preset is set."""
-    p = PRESETS.get(preset) if preset else None
-    if not p:
-        return ""
-    return (f" — palette colors: bg={p['bg']}, atmosphere={p['atmosphere']}, "
-            f"accent={p['accent']}. Paint the background/sky as a gradient from "
-            f"atmosphere (top) to bg (bottom) so it takes the preset's colors; do "
-            f"NOT hardcode a dark or black sky.")
-
-
-def call_claude(prompt, preset=None, seed=42, model='claude-sonnet-4-6', system=None,
+def call_claude(prompt, seed=42, model='claude-sonnet-4-6', system=None,
                 max_tokens=MAX_OUTPUT_TOKENS):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    preset_note = f"\nActive preset: {preset}{_palette_note(preset)}" if preset else ""
     seed_note   = f"\nSeed: {seed}"
     user_content = [{
         "type": "text",
-        "text": f"{prompt}{preset_note}{seed_note}"
+        "text": f"{prompt}{seed_note}"
     }]
 
     response = client.messages.create(
@@ -348,12 +324,12 @@ def _check_syntax(code):
         return str(e)
 
 
-def _generate_python_scene(prompt, preset, seed, model):
+def _generate_python_scene(prompt, seed, model):
     """Python path: generate scene code, then gate it on a syntax check and the
     AST sandbox, each with one Claude retry (a model slip shouldn't fail a legit
     prompt). Returns (code, tokens_in, tokens_out) or raises SceneGenError."""
     try:
-        code, tin, tout, truncated = call_claude(prompt, preset, seed, model)
+        code, tin, tout, truncated = call_claude(prompt, seed, model)
     except Exception as e:
         raise SceneGenError(f"Claude API error: {e}", 500)
 
@@ -368,7 +344,7 @@ def _generate_python_scene(prompt, preset, seed, model):
                 "self-contained scene that fits comfortably within the output limit — favor "
                 "compact loops and fewer hand-written shapes over exhaustive detail. Return "
                 f"ONLY raw Python code — no markdown fences, no prose — for this prompt:\n\n{prompt}",
-                preset, seed, model)
+                seed, model)
             tin += ti; tout += to
         except Exception as e:
             raise SceneGenError(f"Claude API error: {e}", 500)
@@ -383,7 +359,7 @@ def _generate_python_scene(prompt, preset, seed, model):
             code, ti, to, _ = call_claude(
                 f"The following Python scene code has a syntax error: {err}\n\nFix it and "
                 f"return ONLY the corrected raw Python code — no markdown fences, no "
-                f"explanation, no prose:\n\n{code}", preset, seed, model)
+                f"explanation, no prose:\n\n{code}", seed, model)
             tin += ti; tout += to
         except Exception:
             raise SceneGenError(f"Syntax error and fix failed: {err}", 500)
@@ -397,10 +373,10 @@ def _generate_python_scene(prompt, preset, seed, model):
             code, ti, to, _ = call_claude(
                 f"The following Python scene code was rejected by a security sandbox because: "
                 f"{serr}. Rewrite it to draw the same scene using ONLY the pre-injected names "
-                f"(img, draw, W, H, rng, palette, Image, ImageDraw, ImageFont, math, random) "
+                f"(img, draw, W, H, rng, Image, ImageDraw, ImageFont, math, random) "
                 f"with no imports, no dunder attributes, and no eval/exec/open. Return ONLY the "
                 f"corrected raw Python code — no markdown fences, no explanation:\n\n{code}",
-                preset, seed, model)
+                seed, model)
             tin += ti; tout += to
         except Exception:
             raise SceneGenError(f"Scene rejected by sandbox: {serr}", 400)
@@ -423,12 +399,12 @@ def _parse_scene_json(raw):
     return scene, None
 
 
-def _generate_json_scene(prompt, preset, seed, model):
+def _generate_json_scene(prompt, seed, model):
     """JSON path: generate a declarative scene, validate it against the schema,
     one retry on a parse/schema miss. There is no code to sandbox here — a valid
     scene is just data. Returns (scene_dict, tokens_in, tokens_out)."""
     try:
-        raw, tin, tout, truncated = call_claude(prompt, preset, seed, model, system=SYSTEM_PROMPT_JSON)
+        raw, tin, tout, truncated = call_claude(prompt, seed, model, system=SYSTEM_PROMPT_JSON)
     except Exception as e:
         raise SceneGenError(f"Claude API error: {e}", 500)
 
@@ -442,7 +418,7 @@ def _generate_json_scene(prompt, preset, seed, model):
                 "compact scene — use scatter/repeat/bezier and gradient backgrounds instead of "
                 "enumerating many shapes. Return ONLY a single valid JSON object — no prose — "
                 f"for this prompt:\n\n{prompt}",
-                preset, seed, model, system=SYSTEM_PROMPT_JSON)
+                seed, model, system=SYSTEM_PROMPT_JSON)
             tin += ti; tout += to
         except Exception as e:
             raise SceneGenError(f"Claude API error: {e}", 500)
@@ -457,7 +433,7 @@ def _generate_json_scene(prompt, preset, seed, model):
             raw, ti, to, _ = call_claude(
                 f"Your previous response was rejected: {err}. Return ONLY a single valid JSON "
                 f"object matching the scene schema — no markdown fences, no prose:\n\n{raw}",
-                preset, seed, model, system=SYSTEM_PROMPT_JSON)
+                seed, model, system=SYSTEM_PROMPT_JSON)
             tin += ti; tout += to
         except Exception:
             raise SceneGenError(f"Scene rejected: {err}", 400)
@@ -522,27 +498,11 @@ def row_to_dict(row, include_scene=True, tags=None, folders=None):
     d["svg_url"] = f"/static/renders/{d['svg']}" if d.get("svg") else None
     return d
 
-def _preset_ui():
-    """The preset picker's data, derived from renderer.PRESET_INFO so the buttons
-    and popovers never drift from the palettes the renderer actually uses. Leads
-    with a 'None' entry, and gives each a swatch (its accent color) for the chip."""
-    def hexc(rgb):
-        r, g, b = rgb[:3]
-        return f"#{r:02x}{g:02x}{b:02x}"
-    ui = [{"name": "", "label": "None",
-           "description": "No preset — a neutral dark palette; the scene picks its own colors.",
-           "swatch": "#2a2a3a"}]
-    ui += [{"name": p["name"], "label": p["label"], "description": p["description"],
-            "swatch": hexc(p["accent"])} for p in PRESET_INFO]
-    return ui
-
-
 @app.context_processor
 def _asset_versions():
     """Expose static_v('css/app.css') to templates → the file's mtime, appended as
     a ?v= cache-buster. A deploy (git pull) bumps the mtime, so browsers refetch
-    changed CSS/JS instead of serving a stale copy (which silently masked the new
-    preset-popover styles behind an old app.css)."""
+    changed CSS/JS instead of serving a stale copy."""
     def static_v(rel):
         try:
             return str(int(os.path.getmtime(os.path.join(BASE_DIR, "static", rel))))
@@ -560,15 +520,13 @@ def index():
     # alongside CAPTCHA_SECRET (server) for CAPTCHA to work in a browser.
     return render_template("index.html",
                            form_token=anti_abuse.make_form_token(),
-                           captcha_sitekey=os.environ.get("CAPTCHA_SITEKEY", ""),
-                           presets=_preset_ui())
+                           captcha_sitekey=os.environ.get("CAPTCHA_SITEKEY", ""))
 
 # ── routes: generation ─────────────────────────────────────────────────────
 @app.route("/api/generate", methods=["POST"])
 @anti_abuse.generate_rate_limiters()   # strict per-min + per-day cap, applied first
 def generate():
     prompt  = request.form.get("prompt", "").strip()
-    preset  = request.form.get("preset") or None
     # Untrusted numerics: parse + clamp so `seed=abc` no longer 500s and
     # `width=999999` can't DoS the renderer.
     seed    = anti_abuse.safe_int(request.form.get("seed", 42), 42,
@@ -604,9 +562,9 @@ def generate():
     model = request.form.get('model', 'claude-sonnet-4-6')
     try:
         if SCENE_FORMAT == "json":
-            scene_payload, tokens_in, tokens_out = _generate_json_scene(prompt, preset, seed, model)
+            scene_payload, tokens_in, tokens_out = _generate_json_scene(prompt, seed, model)
         else:
-            scene_payload, tokens_in, tokens_out = _generate_python_scene(prompt, preset, seed, model)
+            scene_payload, tokens_in, tokens_out = _generate_python_scene(prompt, seed, model)
     except SceneGenError as e:
         body = {"error": e.message}
         if e.scene is not None:
@@ -621,7 +579,7 @@ def generate():
     try:
         result = _render_scene(
             scene_payload, filename=filename,
-            width=width, height=height, seed=seed, preset=preset
+            width=width, height=height, seed=seed
         )
     except SceneValidationError as e:
         return jsonify({"error": f"Scene rejected by sandbox: {e}", "scene_code": scene_text}), 400
@@ -638,10 +596,10 @@ def generate():
     created_at = datetime.utcnow().isoformat() + "Z"
     db = get_db()
     db.execute("""
-        INSERT INTO images (id, filename, thumb, prompt, preset, seed, width, height,
+        INSERT INTO images (id, filename, thumb, prompt, seed, width, height,
                             tokens_in, tokens_out, model, scene_code, svg, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (img_id, filename, thumb_name, prompt, preset, seed, width, height,
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (img_id, filename, thumb_name, prompt, seed, width, height,
           tokens_in, tokens_out, model, scene_text, svg_name, created_at))
     db.commit()
 
