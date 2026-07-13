@@ -148,6 +148,10 @@ class SVGRecorder:
 
     def rectangle(self, xy, fill=None, outline=None, width=1):
         x0,y0,x1,y1 = xy
+        # Normalize an inverted box so <rect> never gets a negative width/height
+        # (mirrors the PNG path's bbox guard, and the abs() ellipse/arc already use).
+        x0,x1 = min(x0,x1),max(x0,x1)
+        y0,y1 = min(y0,y1),max(y0,y1)
         stroke = f'stroke="{self._col(outline)}" stroke-width="{width}"' if outline else 'stroke="none"'
         self._elems.append(f'<rect x="{x0}" y="{y0}" width="{x1-x0}" height="{y1-y0}" fill="{self._col(fill)}" {stroke}/>')
 
@@ -234,6 +238,68 @@ class SVGRecorder:
                 f'  {body}\n</svg>')
 
 
+# ── inverted-bbox guard for the Python path ──────────────────────────────────
+# Pillow raises "x1 must be greater than or equal to x0" when a box-based op
+# (ellipse/arc/pieslice/chord/rounded_rectangle — and rectangle on older Pillow)
+# is handed an inverted box (x1<x0 or y1<y0). Model scene code routinely computes
+# boxes as center±radius or from two unordered points, so an inverted box is a
+# routine model slip, not abuse — it shouldn't hard-fail an entire render. We
+# normalize the box (min/max) exactly as the JSON path's _bbox already does, so
+# the shape just draws. Only the Python render() path needs this; render_json()
+# is already covered by scene_json._bbox.
+_BBOX_METHODS = frozenset({
+    "ellipse", "rectangle", "arc", "pieslice", "chord", "rounded_rectangle",
+})
+
+
+def _normalize_bbox(xy):
+    """If xy is a bounding box — [x0,y0,x1,y1] or [(x0,y0),(x1,y1)] — return it
+    with x0<=x1 and y0<=y1. Anything else (or anything unparseable) is returned
+    unchanged, so non-box call shapes pass straight through."""
+    try:
+        if len(xy) == 4 and all(isinstance(v, (int, float)) for v in xy):
+            x0, y0, x1, y1 = xy
+        elif len(xy) == 2 and all(len(p) == 2 for p in xy):
+            (x0, y0), (x1, y1) = xy
+        else:
+            return xy
+    except (TypeError, ValueError):
+        return xy
+    return [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
+
+
+class _SafeDraw:
+    """Proxy over a Pillow ImageDraw that normalizes inverted boxes for the
+    box-based methods before delegating; every other attribute passes through to
+    the wrapped ImageDraw untouched."""
+    def __init__(self, draw):
+        self._draw = draw
+
+    def __getattr__(self, name):
+        attr = getattr(self._draw, name)
+        if name in _BBOX_METHODS and callable(attr):
+            def wrapped(xy, *args, **kwargs):
+                return attr(_normalize_bbox(xy), *args, **kwargs)
+            return wrapped
+        return attr
+
+
+class _ImageDrawShim:
+    """Stand-in for the ImageDraw module injected into scene code: .Draw() returns
+    a bbox-normalizing _SafeDraw (the system prompt has the model re-acquire draw
+    via ImageDraw.Draw(img) after every alpha_composite, so wrapping only the
+    initial draw wouldn't be enough). Every other name delegates to the real
+    module so ImageDraw.ImageDraw, .floodfill, etc. still resolve."""
+    def __init__(self, module):
+        self._module = module
+
+    def Draw(self, *args, **kwargs):
+        return _SafeDraw(self._module.Draw(*args, **kwargs))
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+
 def _make_canvas(width, height, preset=None):
     bg = (0,0,0)
     if preset and preset in PRESETS:
@@ -291,7 +357,7 @@ def render(
         # the implicit full builtins that a bare exec(code, {}) would inject.
         "__builtins__": SAFE_BUILTINS,
         "img":       img,
-        "draw":      draw,
+        "draw":      _SafeDraw(draw),
         "svg":       svg_rec,
         "W":         W,
         "H":         H,
@@ -299,7 +365,9 @@ def render(
         "ref":       ref,
         "palette":   palette,
         "Image":     Image,
-        "ImageDraw": ImageDraw,
+        # Shim so ImageDraw.Draw(img) — which the model re-runs after every
+        # alpha_composite — yields a bbox-normalizing draw, not a raw one.
+        "ImageDraw": _ImageDrawShim(ImageDraw),
         "ImageFont": ImageFont,
         "math":      math,
         "random":    random,
@@ -309,7 +377,7 @@ def render(
     for code in codes:
         img = _exec_code(code, ctx)
         ctx["img"]  = img
-        ctx["draw"] = ImageDraw.Draw(img)
+        ctx["draw"] = _SafeDraw(ImageDraw.Draw(img))
 
     meta = {
         "filename":    filename,
