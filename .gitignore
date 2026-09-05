@@ -5,3 +5,4 @@ static/renders/
 .env
 ecosystem.config.js
 venv/
+.venv/

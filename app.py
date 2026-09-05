@@ -1,4 +1,4 @@
-import os, json, sqlite3, uuid, sys
+import os, re, json, sqlite3, uuid, sys
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template, g
 import anthropic
@@ -10,6 +10,56 @@ import anti_abuse
 # so POLY_DB_PATH is env-overridable to a writable volume — this is what lets
 # the app run on a read-only root filesystem. Defaults preserve the local layout.
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+
+# ── .env ───────────────────────────────────────────────────────────────────
+# The app reads its config from the process environment, and the only copy of
+# any key it uses is <app dir>/.env (mode 600, gitignored). Nothing else feeds
+# the process: pm2 is started from a scrubbed shell, so the key is NOT inherited
+# from a login environment any more. Values already in the environment win over
+# the file, so tests and one-off shells can override it. Stdlib only — no
+# python-dotenv, no expansion, no execution: KEY=value lines, `#` comments, an
+# optional `export ` prefix, single/double quotes, CRLF tolerated.
+ENV_FILE = os.environ.get("POLY_ENV_FILE") or os.path.join(BASE_DIR, ".env")
+
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def load_env_file(path=None, environ=None):
+    """Read KEY=value lines from `path` into `environ` (default os.environ)
+    without overriding keys already present. A missing or unreadable file is
+    not an error. Returns the list of keys it set."""
+    path = ENV_FILE if path is None else path
+    environ = os.environ if environ is None else environ
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+    loaded = []
+    for raw in lines:
+        line = raw.strip()                      # also drops a trailing \r
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not _ENV_KEY_RE.match(key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]                 # quoted: taken literally
+        else:
+            value = value.split(" #", 1)[0].rstrip()   # unquoted: trailing comment
+        if key in environ:
+            continue
+        environ[key] = value
+        loaded.append(key)
+    return loaded
+
+
+load_env_file()
+
 RENDERS_DIR = os.path.join(BASE_DIR, "static", "renders")
 DB_PATH     = os.environ.get("POLY_DB_PATH") or os.path.join(BASE_DIR, "poly.db")
 RENDERER    = os.path.join(BASE_DIR, "renderer.py")

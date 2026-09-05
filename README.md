@@ -9,9 +9,13 @@ Results are stored in SQLite (`poly.db`) and written to `static/renders/`.
 
 ```bash
 pip install flask pillow anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
+cp .env.example .env     # put your ANTHROPIC_API_KEY in it (gitignored)
 python app.py            # http://127.0.0.1:8040
 ```
+
+`app.py` reads `.env` from its own directory at startup (plain `KEY=value`
+lines; values already in the environment win, so `export ANTHROPIC_API_KEY=...`
+still works too). `POLY_ENV_FILE=/path/to/file` points it elsewhere.
 
 ## Anti-abuse
 
