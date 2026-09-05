@@ -26,17 +26,48 @@ so it uses the default `local` (the in-process subprocess sandbox).
 
 ### Deploy / redeploy
 
+There is no `bin/<stub>` operate CLI in this repo; the deploy is the commands
+below, by hand, as root on the droplet.
+
 ```bash
 cd /var/www/poly
 git pull
 python3 -m venv .venv && . .venv/bin/activate    # first time only
 pip install -r requirements.txt
-# .env holds ANTHROPIC_API_KEY (the app loads it); the app listens on 8040
-pm2 restart poly-app
+pm2 restart poly-app         # from a fresh login shell (see "The API key" below)
 # first time instead:
 #   pm2 start app.py --name poly-app --interpreter python3
 pm2 save                     # snapshot the current process list to the dump
 ```
+
+### The API key
+
+`/var/www/poly/.env` is the **only** copy of `ANTHROPIC_API_KEY` the app uses.
+`app.py` reads that file itself at startup (`KEY=value` lines, `#` comments,
+optional `export `, quotes; no expansion) and then reads the environment as
+before — a value already in the process environment wins over the file. The key
+is deliberately *not* in `/etc/environment` or any login shell any more: pm2
+registrations are created from a scrubbed environment so its dump never carries
+a key, and the app must not depend on inheriting one.
+
+```bash
+cd /var/www/poly
+touch .env && chmod 600 .env
+$EDITOR .env                 # ANTHROPIC_API_KEY=sk-ant-...   (see .env.example)
+pm2 restart poly-app         # the file is read at start, so restart after editing
+```
+
+Restart from a **fresh login shell** — one in which you have not `export`ed the
+key — so the value pm2 records for the process comes from the file, not from
+your shell. `.env` is gitignored and survives `git pull`. `POLY_ENV_FILE` can
+point the app at a different file, but on this box leave it unset.
+
+**Without the key** the app starts and serves the gallery, tags, and existing
+renders normally, but every `POST /api/generate` fails: the Anthropic client is
+constructed with an empty key and the request is rejected by the API (the error
+surfaces in `pm2 logs poly-app`). The optional model-based prompt moderation is
+also skipped when the key is empty. So if generation stops working after a
+restart, check `.env` first.
 
 **One time per droplet — install pm2's boot hook, or `poly-app` won't come back
 after a reboot.** `pm2 save` only writes the dump; without the systemd hook
@@ -183,7 +214,8 @@ polygons.example.com {
 
 ## Environment variables
 
-`ANTHROPIC_API_KEY` is required (via `.env`). All anti-abuse and sandbox knobs
+`ANTHROPIC_API_KEY` is required, via `<app dir>/.env`, which `app.py` reads itself
+(Compose also passes it through `env_file`). All anti-abuse and sandbox knobs
 are documented in the README; the deployment-relevant additions are:
 
 | Var | Default | Meaning |
