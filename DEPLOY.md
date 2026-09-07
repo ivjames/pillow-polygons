@@ -31,6 +31,7 @@ below, by hand, as root on the droplet.
 
 ```bash
 cd /var/www/poly
+git status -sb               # MUST read: ## main...origin/main  (see below)
 git pull
 python3 -m venv .venv && . .venv/bin/activate    # first time only
 pip install -r requirements.txt
@@ -39,6 +40,37 @@ pm2 restart poly-app         # from a fresh login shell (see "The API key" below
 #   pm2 start app.py --name poly-app --interpreter python3
 pm2 save                     # snapshot the current process list to the dump
 ```
+
+> **`git pull` goes quiet on the wrong branch.** It reports "Already up to
+> date" truthfully about whatever branch the checkout is on, so a web dir left
+> on some other branch keeps serving a stale build while every deploy looks
+> clean. `ivjames/forest` did this on the same droplet for three weeks. Most
+> lab980 sites avoid it by hard-resetting to an explicit `origin/<branch>`;
+> this one has no operate CLI and pulls by hand, so the check has to be
+> manual. If `git status -sb` is not `## main...origin/main`:
+>
+> ```bash
+> git pull origin main                # unblocks this deploy
+> git checkout -B main origin/main    # then pin it, or the next bare pull goes quiet again
+> git branch -u origin/main main
+> ```
+
+### Confirm what is actually live
+
+A 200 proves the endpoint answered, not which build it served — and there is no
+`poly status` here to ask. Compare the deployed commit against the branch:
+
+```bash
+git -C /var/www/poly fetch -q origin main
+git -C /var/www/poly rev-parse HEAD          # what is deployed
+git -C /var/www/poly rev-parse origin/main   # what should be
+```
+
+Fetch first, and compare against `origin/main` rather than local `main`: a
+stale clone and a stale deploy hash identically, so the local-ref version of
+this check passes in exactly the case it exists to catch. From outside the box,
+`curl -s https://poly.lab980.com/api/tags` answering `200` shows the app is up
+but says nothing about the build (verified 2026-09-07: `200`, body `[]`).
 
 ### The API key
 
